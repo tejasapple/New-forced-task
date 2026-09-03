@@ -80,12 +80,13 @@ def format_telegram_link(link: str) -> str:
 
 # --- Helper Function to Normalize Kurigram Styles ---
 def normalize_style(style_str: str) -> str:
-    """Kurigram के लिए सही कलर नेम्स सुनिश्चित करता है"""
+    """Kurigram और पुराने कलर लॉजिक के लिए सही कलर नेम्स सुनिश्चित करता है"""
     if not style_str: return "primary"
     s = str(style_str).strip().lower()
     if s in ["success", "green"]: return "success"
     if s in ["danger", "red"]: return "danger"
     if s in ["default", "grey", "secondary", "white"]: return "secondary"
+    if s in ["primary", "blue"]: return "primary"
     return "primary"
 
 # --- Helper Function for Styled Buttons (100% Error Proof) ---
@@ -98,16 +99,25 @@ def create_btn(text, callback_data=None, url=None, style="primary"):
         
     safe_style = normalize_style(style)
     
-    try:
-        # Kurigram/Modified Pyrogram के लिए 
-        return InlineKeyboardButton(**kwargs, style=safe_style)
-    except TypeError:
-        pass
+    # पुरानी फाइल का इंटीग्रेटेड कलर लॉजिक: api_kwargs सपोर्ट
+    if safe_style != "secondary":
+        kwargs["api_kwargs"] = {"style": safe_style}
         
-    # अगर नार्मल Pyrogram है तो बिना एरर के डिफ़ॉल्ट बटन बनाएगा लेकिन एट्रिब्यूट सेव रखेगा
-    btn = InlineKeyboardButton(**kwargs)
-    setattr(btn, "style", safe_style) 
-    return btn
+    try:
+        # अगर लाइब्रेरी सीधे api_kwargs सपोर्ट करती है
+        return InlineKeyboardButton(**kwargs)
+    except TypeError:
+        # अगर लाइब्रेरी natively सपोर्ट नहीं करती है, तो फॉलबैक लॉजिक
+        if "api_kwargs" in kwargs:
+            del kwargs["api_kwargs"]
+        try:
+            # Kurigram/Modified Pyrogram के लिए 
+            return InlineKeyboardButton(**kwargs, style=safe_style)
+        except TypeError:
+            # अगर नार्मल Pyrogram है तो बिना एरर के डिफ़ॉल्ट बटन बनाएगा लेकिन एट्रिब्यूट सेव रखेगा
+            btn = InlineKeyboardButton(**kwargs)
+            setattr(btn, "style", safe_style) 
+            return btn
 
 # --- 3. UI Admin Panel Helper ---
 async def send_admin_panel(message_or_callback):
@@ -563,43 +573,59 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_settings")]])
         await safe_edit(callback_query, "👉 Send the new **Telegram FSub Channel ID or Username** (e.g., `-10012345678` or `@mychannel`):\n*(Note: बोट को इस चैनल में एडमिन होना ज़रूरी है)*", reply_markup=btn)
         
-    elif data == "remove_fsub_menu":
-        await callback_query.answer()
-        config = await settings_col.find_one({"_id": "config"})
-        fsubs = config.get("fsub", [])
-        if not fsubs:
-            return await callback_query.answer("No FSub Channels to remove!", show_alert=True)
-            
-        buttons = []
-        for idx, f in enumerate(fsubs):
-            buttons.append([InlineKeyboardButton(f"❌ Remove Channel {idx+1} ({f['id']})", callback_data=f"del_fsub_{idx}")])
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_settings")])
-        
-        await safe_edit(callback_query, "🗑 **Select FSub channel to remove:**", reply_markup=InlineKeyboardMarkup(buttons))
-        
-    elif data.startswith("del_fsub_"):
-        idx = int(data.split("_")[2])
-        config = await settings_col.find_one({"_id": "config"})
-        fsubs = config.get("fsub", [])
-        if 0 <= idx < len(fsubs):
-            fsubs.pop(idx)
-            await settings_col.update_one({"_id": "config"}, {"$set": {"fsub": fsubs}})
-            
-        await callback_query.answer("Channel removed!", show_alert=True)
+    elif data == "add_fsub_link":
+        fsub_id = admin_states[admin_id]["fsub_id"]
+        fsub_link = format_telegram_link(message.text)
         
         config = await settings_col.find_one({"_id": "config"})
         fsubs = config.get("fsub", [])
-        fsub_style = config.get("fsub_style", "primary")
-        text = f"⚙️ **Multi-FSub Settings**\n\n**Current Channels: {len(fsubs)}**\n\n"
-        for i, f in enumerate(fsubs):
-            text += f"{i+1}. ID: `{f['id']}`\n"
-        btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add FSub Channel", callback_data="add_fsub_start")],
-            [InlineKeyboardButton("🗑 Remove FSub Channel", callback_data="remove_fsub_menu")],
-            [InlineKeyboardButton(f"🎨 FSub Button Color ({fsub_style.capitalize()})", callback_data="admin_fsub_color")],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]
-        ])
-        await safe_edit(callback_query, text, reply_markup=btn)
+        fsubs.append({"id": fsub_id, "link": fsub_link})
+        
+        await settings_col.update_one({"_id": "config"}, {"$set": {"fsub": fsubs}})
+        del admin_states[admin_id]
+        
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_settings")]])
+        await message.reply_text("✅ नया FSub Channel सफलतापूर्वक जोड़ दिया गया है!", reply_markup=btn)
+
+@app.on_callback_query(filters.regex(r"^remove_fsub_menu$"))
+async def remove_fsub_menu_callback(client, callback_query: CallbackQuery):
+    await callback_query.answer()
+    config = await settings_col.find_one({"_id": "config"})
+    fsubs = config.get("fsub", [])
+    if not fsubs:
+        return await callback_query.answer("No FSub Channels to remove!", show_alert=True)
+        
+    buttons = []
+    for idx, f in enumerate(fsubs):
+        buttons.append([InlineKeyboardButton(f"❌ Remove Channel {idx+1} ({f['id']})", callback_data=f"del_fsub_{idx}")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_settings")])
+    
+    await safe_edit(callback_query, "🗑 **Select FSub channel to remove:**", reply_markup=InlineKeyboardMarkup(buttons))
+    
+@app.on_callback_query(filters.regex(r"^del_fsub_"))
+async def del_fsub_callback(client, callback_query: CallbackQuery):
+    idx = int(callback_query.data.split("_")[2])
+    config = await settings_col.find_one({"_id": "config"})
+    fsubs = config.get("fsub", [])
+    if 0 <= idx < len(fsubs):
+        fsubs.pop(idx)
+        await settings_col.update_one({"_id": "config"}, {"$set": {"fsub": fsubs}})
+        
+    await callback_query.answer("Channel removed!", show_alert=True)
+    
+    config = await settings_col.find_one({"_id": "config"})
+    fsubs = config.get("fsub", [])
+    fsub_style = config.get("fsub_style", "primary")
+    text = f"⚙️ **Multi-FSub Settings**\n\n**Current Channels: {len(fsubs)}**\n\n"
+    for i, f in enumerate(fsubs):
+        text += f"{i+1}. ID: `{f['id']}`\n"
+    btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add FSub Channel", callback_data="add_fsub_start")],
+        [InlineKeyboardButton("🗑 Remove FSub Channel", callback_data="remove_fsub_menu")],
+        [InlineKeyboardButton(f"🎨 FSub Button Color ({fsub_style.capitalize()})", callback_data="admin_fsub_color")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]
+    ])
+    await safe_edit(callback_query, text, reply_markup=btn)
 
 # --- 9. STATE MACHINE (Handles text inputs) ---
 @app.on_message(filters.private & filters.user(ADMINS) & ~filters.command(["start"]))
