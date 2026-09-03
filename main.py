@@ -35,28 +35,15 @@ async def init_settings():
             "fsub_style": "primary" 
         })
 
-# --- NEW: Dynamic Batch Regenerator ---
-async def regenerate_batch(batch_id, update_dict=None):
+# --- NEW: Permanent Batch Updater ---
+async def update_batch_data(batch_id, update_dict=None):
     """
-    जब भी कोई बैच अपडेट होता है (कलर, लिंक आदि), 
-    तो यह एक नया सुरक्षित बैच लिंक बना देता है और पुराने को हटा देता है।
+    अब यह फंक्शन कोई नया लिंक नहीं बनाता। 
+    यह सिर्फ पुराने बैच में नया डेटा (कलर, लिंक आदि) अपडेट कर देता है, जिससे लिंक Permanent रहता है।
     """
-    if update_dict is None:
-        update_dict = {}
-        
-    base = batch_id.split("_rev")[0]
-    new_batch_id = f"{base}_rev{random.randint(10000, 99999)}"
-    update_dict["batch_id"] = new_batch_id
-    
-    await batches_col.update_one({"batch_id": batch_id}, {"$set": update_dict})
-    await users_col.update_many({"joined_batches": batch_id}, {"$set": {"joined_batches.$": new_batch_id}})
-    
-    await users_col.update_many(
-        {f"batches.{batch_id}": {"$exists": True}},
-        {"$rename": {f"batches.{batch_id}": f"batches.{new_batch_id}"}}
-    )
-    
-    return new_batch_id
+    if update_dict:
+        await batches_col.update_one({"batch_id": batch_id}, {"$set": update_dict})
+    return batch_id
 
 # ==========================================
 # --- COLOR BUTTON HTTP BYPASS SYSTEM ---
@@ -408,16 +395,31 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         batches = await batches_col.find().to_list(length=None)
         batch_stats = ""
         for b in batches:
-            b_count = await users_col.count_documents({"joined_batches": b['batch_id']})
-            batch_stats += f"▪️ **{b['batch_id']}**: {b_count} users\n"
+            b_id = b['batch_id']
+            # Total users joined this batch
+            b_count = await users_col.count_documents({"joined_batches": b_id})
+            # Today's new users in this batch
+            today_b_count = await users_col.count_documents({
+                "joined_batches": b_id,
+                "join_date": {"$gte": today_start}
+            })
+            # Total users who have successfully referred at least 1 person for this batch
+            b_shared_count = await users_col.count_documents({f"batches.{b_id}": {"$gt": 0}})
+            
+            batch_stats += (
+                f"▪️ **Batch: {b_id}**\n"
+                f"   👥 Total Joined: {b_count}\n"
+                f"   🆕 Joined Today: {today_b_count}\n"
+                f"   📤 Promoters (Shared): {b_shared_count}\n\n"
+            )
 
         text = (
-            f"📊 **Live Stats Dashboard**\n\n"
-            f"👥 **Total Active Users:** {total_users}\n"
+            f"📊 **Global Live Stats Dashboard**\n\n"
+            f"🌍 **Total Active Users:** {total_users}\n"
             f"📈 **Today's New Users:** {today_users}\n"
-            f"🔗 **Users from Shares:** {shared_users}\n"
+            f"🔗 **Total Users from Shares:** {shared_users}\n"
             f"📦 **Total Active Batches:** {total_batches}\n\n"
-            f"📋 **Batch-wise Activity:**\n{batch_stats if batch_stats else 'No active batches'}"
+            f"📋 **Batch-wise Detailed Activity:**\n\n{batch_stats if batch_stats else 'No active batches'}"
         )
         btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Menu", callback_data="admin_panel", style="secondary")]])
         await safe_edit(callback_query, text, reply_markup=btn)
@@ -486,16 +488,16 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         _, btn_type, style, batch_id = data.split("_", 3)
         db_field = f"style_{btn_type}"
         
-        new_batch_id = await regenerate_batch(batch_id, {db_field: style})
-        await callback_query.answer(f"Style updated! New Secure Batch Link Generated.", show_alert=True)
+        await update_batch_data(batch_id, {db_field: style})
+        await callback_query.answer(f"Style updated! Batch link remains permanent.", show_alert=True)
         
         btn = InlineKeyboardMarkup([
-            [create_btn("📤 Share Button", callback_data=f"btnselect_share_{new_batch_id}")],
-            [create_btn("🔓 Unlock Button", callback_data=f"btnselect_unlock_{new_batch_id}")],
-            [create_btn("💎 Buy VIP+ Button", callback_data=f"btnselect_vip_{new_batch_id}")],
-            [create_btn("🔙 Back to Batch", callback_data=f"admin_viewbatch_{new_batch_id}", style="secondary")]
+            [create_btn("📤 Share Button", callback_data=f"btnselect_share_{batch_id}")],
+            [create_btn("🔓 Unlock Button", callback_data=f"btnselect_unlock_{batch_id}")],
+            [create_btn("💎 Buy VIP+ Button", callback_data=f"btnselect_vip_{batch_id}")],
+            [create_btn("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}", style="secondary")]
         ])
-        await safe_edit(callback_query, f"✅ **{btn_type.capitalize()}** Button set to **{style.capitalize()}**\n\n🚀 **नया बैच लिंक बन गया है (पुराना लिंक अब काम नहीं करेगा)!**\n\n🎨 **Edit Button Styles**", reply_markup=btn)
+        await safe_edit(callback_query, f"✅ **{btn_type.capitalize()}** Button set to **{style.capitalize()}**\n\n🎨 **Edit Button Styles**", reply_markup=btn)
 
     elif data.startswith("editlink_"):
         await callback_query.answer()
@@ -687,32 +689,32 @@ async def admin_state_machine(client, message: Message):
         batch_id = state_info["batch_id"]
         new_link = format_telegram_link(message.text)
         
-        new_batch_id = await regenerate_batch(batch_id, {"unlock_link": new_link})
+        await update_batch_data(batch_id, {"unlock_link": new_link})
         del admin_states[admin_id]
         
-        btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Batch", callback_data=f"admin_viewbatch_{new_batch_id}", style="secondary")]])
-        await safe_reply(message, f"✅ Unlock Link updated!\n🚀 **New Batch ID Generated:** `{new_batch_id}` (Old link has been disabled)", reply_markup=btn)
+        btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}", style="secondary")]])
+        await safe_reply(message, f"✅ Unlock Link updated!\n🚀 **Batch ID:** `{batch_id}` (Link is permanent)", reply_markup=btn)
 
     elif action == "edit_batch_vip":
         batch_id = state_info["batch_id"]
         new_link = format_telegram_link(message.text)
         
-        new_batch_id = await regenerate_batch(batch_id, {"vip_link": new_link})
+        await update_batch_data(batch_id, {"vip_link": new_link})
         del admin_states[admin_id]
         
-        btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Batch", callback_data=f"admin_viewbatch_{new_batch_id}", style="secondary")]])
-        await safe_reply(message, f"✅ Buy VIP+ Link updated!\n🚀 **New Batch ID Generated:** `{new_batch_id}` (Old link has been disabled)", reply_markup=btn)
+        btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}", style="secondary")]])
+        await safe_reply(message, f"✅ Buy VIP+ Link updated!\n🚀 **Batch ID:** `{batch_id}` (Link is permanent)", reply_markup=btn)
 
     elif action == "edit_batch_req":
         if not message.text.isdigit():
             return await safe_reply(message, "❌ Please send a valid number.")
         batch_id = state_info["batch_id"]
         
-        new_batch_id = await regenerate_batch(batch_id, {"req_shares": int(message.text)})
+        await update_batch_data(batch_id, {"req_shares": int(message.text)})
         del admin_states[admin_id]
         
-        btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Batch", callback_data=f"admin_viewbatch_{new_batch_id}", style="secondary")]])
-        await safe_reply(message, f"✅ Required shares updated!\n🚀 **New Batch ID Generated:** `{new_batch_id}` (Old link has been disabled)", reply_markup=btn)
+        btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}", style="secondary")]])
+        await safe_reply(message, f"✅ Required shares updated!\n🚀 **Batch ID:** `{batch_id}` (Link is permanent)", reply_markup=btn)
 
     elif action == "add_batch_name":
         admin_states[admin_id]["batch_id"] = message.text.replace(" ", "_")
