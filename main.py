@@ -27,13 +27,21 @@ settings_col = db["settings"]
 # Admin states ट्रैक करने के लिए (UI Inputs के लिए)
 admin_states = {} 
 
+# --- NEW: In-Memory Cache for Millisecond Response ---
+SETTINGS_CACHE = {}
+
 async def init_settings():
-    if not await settings_col.find_one({"_id": "config"}):
-        await settings_col.insert_one({
+    config = await settings_col.find_one({"_id": "config"})
+    if not config:
+        config = {
             "_id": "config", 
             "fsub": [], 
             "fsub_style": "primary" 
-        })
+        }
+        await settings_col.insert_one(config)
+    
+    # लोड होते ही कैश में सेव कर दें ताकि बटन फास्ट काम करें
+    SETTINGS_CACHE.update(config)
 
 # --- NEW: Permanent Batch Updater ---
 async def update_batch_data(batch_id, update_dict=None):
@@ -52,10 +60,12 @@ async def update_batch_data(batch_id, update_dict=None):
 http_session = None
 
 async def get_http_session():
-    """Global HTTP Session for faster API calls without lag"""
+    """Global HTTP Session for faster API calls without lag (Optimized for Milliseconds)"""
     global http_session
     if http_session is None or http_session.closed:
-        http_session = aiohttp.ClientSession()
+        # TCPConnector और keepalive के साथ कनेक्शन बहुत फास्ट होगा
+        connector = aiohttp.TCPConnector(limit=100, keepalive_timeout=300)
+        http_session = aiohttp.ClientSession(connector=connector)
     return http_session
 
 async def send_via_http(method: str, payload: dict):
@@ -171,13 +181,13 @@ async def auto_approve_requests(client, message: ChatJoinRequest):
     except Exception as e:
         print(f"Auto Approve Error: {e}")
 
-# --- 5. Strict Telegram Force Subscribe Checker ---
+# --- 5. Strict Telegram Force Subscribe Checker (Optimized with Cache) ---
 async def check_fsub(client, user_id):
     if user_id in ADMINS:
         return [] 
     
-    config = await settings_col.find_one({"_id": "config"})
-    fsubs = config.get("fsub", [])
+    # DB Call की जगह Cache का यूज़ करके रिस्पांस टाइम को इंस्टेंट कर दिया है
+    fsubs = SETTINGS_CACHE.get("fsub", [])
     
     if not fsubs:
         return [] 
@@ -212,8 +222,8 @@ async def send_fsub_message(message, start_data, not_joined):
     
     cb_data = f"checkfsub_{start_data}" if start_data else "checkfsub_none"
     
-    config = await settings_col.find_one({"_id": "config"})
-    fsub_style = config.get("fsub_style", "primary")
+    # यहाँ भी DB की जगह Cache का यूज़ 
+    fsub_style = SETTINGS_CACHE.get("fsub_style", "primary")
     
     buttons = []
     for idx, ch in enumerate(not_joined):
@@ -340,6 +350,7 @@ async def check_fsub_callback(client, callback_query: CallbackQuery):
 
     not_joined = await check_fsub(client, user_id)
     if not_joined:
+        # अगर अलर्ट शो करना है, तो यहीं कर देंगे (लेकिन अब यह कैशिंग की वजह से तुरंत आएगा)
         return await callback_query.answer("❌ कृपया पहले सभी चैनल ज्वाइन करें या रिक्वेस्ट सेंड करें!", show_alert=True)
     
     await callback_query.answer() 
@@ -356,14 +367,17 @@ async def unlock_button(client, callback_query: CallbackQuery):
     if await check_fsub(client, user_id):
         return await callback_query.answer("❌ पहले सभी टेलीग्राम चैनल ज्वाइन करें!", show_alert=True)
 
-    user_data = await users_col.find_one({"user_id": user_id})
-    batch_data = await batches_col.find_one({"batch_id": batch_id})
+    # Parallel Execution: दोनों डेटाबेस क्वेरी एक साथ चलाकर रिस्पांस 2x फास्ट कर दिया
+    user_data, batch_data = await asyncio.gather(
+        users_col.find_one({"user_id": user_id}),
+        batches_col.find_one({"batch_id": batch_id})
+    )
     
     if not batch_data:
         return await callback_query.answer("Batch Expired or Removed!", show_alert=True)
 
     req_shares = batch_data['req_shares']
-    user_refs = user_data.get("batches", {}).get(batch_id, 0)
+    user_refs = user_data.get("batches", {}).get(batch_id, 0) if user_data else 0
 
     if user_refs >= req_shares:
         await callback_query.answer()
@@ -394,13 +408,15 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
 
     elif data == "admin_stats":
         await callback_query.answer()
-        total_users = await users_col.count_documents({})
-        total_batches = await batches_col.count_documents({})
-        
+        # Parallel DB Queries for Millisecond Loading
         today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        today_users = await users_col.count_documents({"join_date": {"$gte": today_start}})
         
-        shared_users = await users_col.count_documents({"referred_by": {"$ne": None}})
+        total_users, total_batches, today_users, shared_users = await asyncio.gather(
+            users_col.count_documents({}),
+            batches_col.count_documents({}),
+            users_col.count_documents({"join_date": {"$gte": today_start}}),
+            users_col.count_documents({"referred_by": {"$ne": None}})
+        )
         
         batches = await batches_col.find().to_list(length=None)
         batch_stats = ""
@@ -557,9 +573,9 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
 
     elif data == "admin_settings":
         await callback_query.answer()
-        config = await settings_col.find_one({"_id": "config"})
-        fsubs = config.get("fsub", [])
-        fsub_style = config.get("fsub_style", "primary")
+        # Fetching directly from Cache
+        fsubs = SETTINGS_CACHE.get("fsub", [])
+        fsub_style = SETTINGS_CACHE.get("fsub_style", "primary")
         
         text = f"⚙️ **Multi-FSub Settings**\n\n**Current Channels: {len(fsubs)}**\n\n"
         for idx, f in enumerate(fsubs):
@@ -586,10 +602,12 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
     elif data.startswith("setfsubstyle_"):
         style = data.split("_")[1]
         await settings_col.update_one({"_id": "config"}, {"$set": {"fsub_style": style}})
+        # Updating Cache instantly
+        SETTINGS_CACHE["fsub_style"] = style 
+        
         await callback_query.answer(f"FSub Style updated to {style.capitalize()}!", show_alert=True)
         
-        config = await settings_col.find_one({"_id": "config"})
-        fsubs = config.get("fsub", [])
+        fsubs = SETTINGS_CACHE.get("fsub", [])
         text = f"⚙️ **Multi-FSub Settings**\n\n**Current Channels: {len(fsubs)}**\n\n"
         for idx, f in enumerate(fsubs):
             text += f"{idx+1}. ID: `{f['id']}`\n"
@@ -611,8 +629,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
 @app.on_callback_query(filters.regex(r"^remove_fsub_menu$"))
 async def remove_fsub_menu_callback(client, callback_query: CallbackQuery):
     await callback_query.answer()
-    config = await settings_col.find_one({"_id": "config"})
-    fsubs = config.get("fsub", [])
+    fsubs = SETTINGS_CACHE.get("fsub", [])
     if not fsubs:
         return await callback_query.answer("No FSub Channels to remove!", show_alert=True)
         
@@ -626,17 +643,16 @@ async def remove_fsub_menu_callback(client, callback_query: CallbackQuery):
 @app.on_callback_query(filters.regex(r"^del_fsub_"))
 async def del_fsub_callback(client, callback_query: CallbackQuery):
     idx = int(callback_query.data.split("_")[2])
-    config = await settings_col.find_one({"_id": "config"})
-    fsubs = config.get("fsub", [])
+    fsubs = SETTINGS_CACHE.get("fsub", [])
     if 0 <= idx < len(fsubs):
         fsubs.pop(idx)
         await settings_col.update_one({"_id": "config"}, {"$set": {"fsub": fsubs}})
+        SETTINGS_CACHE["fsub"] = fsubs # Cache Update
         
     await callback_query.answer("Channel removed!", show_alert=True)
     
-    config = await settings_col.find_one({"_id": "config"})
-    fsubs = config.get("fsub", [])
-    fsub_style = config.get("fsub_style", "primary")
+    fsubs = SETTINGS_CACHE.get("fsub", [])
+    fsub_style = SETTINGS_CACHE.get("fsub_style", "primary")
     text = f"⚙️ **Multi-FSub Settings**\n\n**Current Channels: {len(fsubs)}**\n\n"
     for i, f in enumerate(fsubs):
         text += f"{i+1}. ID: `{f['id']}`\n"
@@ -765,11 +781,12 @@ async def admin_state_machine(client, message: Message):
         fsub_id = admin_states[admin_id]["fsub_id"]
         fsub_link = format_telegram_link(message.text)
         
-        config = await settings_col.find_one({"_id": "config"})
-        fsubs = config.get("fsub", [])
+        fsubs = SETTINGS_CACHE.get("fsub", [])
         fsubs.append({"id": fsub_id, "link": fsub_link})
         
         await settings_col.update_one({"_id": "config"}, {"$set": {"fsub": fsubs}})
+        SETTINGS_CACHE["fsub"] = fsubs # Cache Update
+        
         del admin_states[admin_id]
         
         btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Settings", callback_data="admin_settings", style="secondary")]])
@@ -805,5 +822,5 @@ async def skip_vip_callback(client, callback_query: CallbackQuery):
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_settings()) 
-    print("🚀 Fully Automated Telegram Admin UI Bot is starting...")
+    print("🚀 Fully Automated Telegram Admin UI Bot is starting... (Fast Performance Enabled)")
     app.run()
