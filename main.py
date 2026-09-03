@@ -31,12 +31,33 @@ async def init_settings():
             "fsub": [] # मल्टीपल चैनल्स के लिए लिस्ट
         })
 
+# --- Helper Function for Safe Edits (Prevents Bot Freezing) ---
+async def safe_edit(callback_query: CallbackQuery, text: str, reply_markup=None):
+    """अगर टेक्स्ट सेम हो, तो यह टेलीग्राम का MessageNotModified एरर बाईपास कर देगा (बोट लॉक नहीं होगा)"""
+    try:
+        if reply_markup:
+            await callback_query.edit_message_text(text, reply_markup=reply_markup)
+        else:
+            await callback_query.edit_message_text(text)
+    except Exception:
+        pass # एरर को इग्नोर करके बॉट को चालू रखेगा
+
 # --- Helper Function for Link Parsing (Supports @username) ---
 def format_telegram_link(link: str) -> str:
     link = link.strip()
     if link.startswith("@"):
         return f"https://t.me/{link[1:]}"
     return link
+
+# --- Helper Function to Normalize Kurigram Styles ---
+def normalize_style(style_str: str) -> str:
+    """Kurigram के लिए सही कलर नेम्स सुनिश्चित करता है"""
+    if not style_str: return "primary"
+    s = str(style_str).strip().lower()
+    if s in ["success", "green"]: return "success"
+    if s in ["danger", "red"]: return "danger"
+    if s in ["default", "grey", "secondary", "white"]: return "secondary"
+    return "primary"
 
 # --- Helper Function for Styled Buttons (Kurigram Support) ---
 def create_btn(text, callback_data=None, url=None, style="primary"):
@@ -49,9 +70,12 @@ def create_btn(text, callback_data=None, url=None, style="primary"):
         kwargs["callback_data"] = callback_data
     if url:
         kwargs["url"] = url
+        
+    safe_style = normalize_style(style)
+    
     try:
         # Kurigram/Modified Pyrogram के लिए 
-        return InlineKeyboardButton(**kwargs, style=style)
+        return InlineKeyboardButton(**kwargs, style=safe_style)
     except TypeError:
         # अगर नार्मल Pyrogram है तो बिना एरर के डिफ़ॉल्ट बटन बनाएगा 
         return InlineKeyboardButton(**kwargs)
@@ -70,7 +94,7 @@ async def send_admin_panel(message_or_callback):
     if isinstance(message_or_callback, Message):
         await message_or_callback.reply_text(text, reply_markup=btn)
     else:
-        await message_or_callback.edit_message_text(text, reply_markup=btn)
+        await safe_edit(message_or_callback, text, reply_markup=btn)
 
 # --- 4. Auto Approve Join Requests (अगर कोई रिक्वेस्ट डालता है तो) ---
 @app.on_chat_join_request()
@@ -124,16 +148,16 @@ async def send_fsub_message(message, start_data, not_joined):
     
     buttons = []
     for idx, ch in enumerate(not_joined):
-        buttons.append([InlineKeyboardButton(f"📢 Join Channel {idx+1}", url=ch["link"])])
+        buttons.append([create_btn(f"📢 Join Channel {idx+1}", url=ch["link"], style="primary")])
         
-    buttons.append([InlineKeyboardButton("🔄 Try Again", callback_data=cb_data)])
+    buttons.append([create_btn("🔄 Try Again", callback_data=cb_data, style="success")])
     
     btn = InlineKeyboardMarkup(buttons)
     
     if isinstance(message, Message):
         await message.reply_text(text, reply_markup=btn)
     else:
-        await message.edit_message_text(text, reply_markup=btn)
+        await safe_edit(message, text, reply_markup=btn)
 
 # --- 6. Start & Batch Logic ---
 @app.on_message(filters.command("start") & filters.private)
@@ -196,7 +220,7 @@ async def process_batch_start(client, message_or_callback, user_id, start_data):
             if isinstance(message_or_callback, Message):
                 return await message_or_callback.reply_text(text)
             else:
-                return await message_or_callback.edit_message_text(text)
+                return await safe_edit(message_or_callback, text)
 
         await users_col.update_one({"user_id": user_id}, {"$addToSet": {"joined_batches": batch_id}})
 
@@ -212,8 +236,8 @@ async def process_batch_start(client, message_or_callback, user_id, start_data):
 
         # Dynamic Styles Fetched from DB (Default to primary)
         style_share = batch_info.get("style_share", "primary")
-        style_unlock = batch_info.get("style_unlock", "primary")
-        style_vip = batch_info.get("style_vip", "primary")
+        style_unlock = batch_info.get("style_unlock", "secondary") # Updated default grey for unlock
+        style_vip = batch_info.get("style_vip", "success") # Updated default green for VIP
 
         buttons = [
             [create_btn(f"📤 Share with {req_shares} friends", url=share_url, style=style_share)],
@@ -227,7 +251,7 @@ async def process_batch_start(client, message_or_callback, user_id, start_data):
         if isinstance(message_or_callback, Message):
             await message_or_callback.reply_text(final_text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
-            await message_or_callback.edit_message_text(final_text, reply_markup=InlineKeyboardMarkup(buttons))
+            await safe_edit(message_or_callback, final_text, reply_markup=InlineKeyboardMarkup(buttons))
 
     except Exception as e:
         print(e)
@@ -235,7 +259,7 @@ async def process_batch_start(client, message_or_callback, user_id, start_data):
         if isinstance(message_or_callback, Message):
             await message_or_callback.reply_text(text)
         else:
-            await message_or_callback.edit_message_text(text)
+            await safe_edit(message_or_callback, text)
 
 # --- 7. Normal User Callbacks (FSub, Unlock) ---
 @app.on_callback_query(filters.regex(r"^checkfsub_"))
@@ -251,7 +275,7 @@ async def check_fsub_callback(client, callback_query: CallbackQuery):
     if start_data and start_data != "none":
         await process_batch_start(client, callback_query, user_id, start_data)
     else:
-        await callback_query.edit_message_text("👋 Welcome! Please use a valid batch link to start.")
+        await safe_edit(callback_query, "👋 Welcome! Please use a valid batch link to start.")
 
 @app.on_callback_query(filters.regex(r"^unlock_"))
 async def unlock_button(client, callback_query: CallbackQuery):
@@ -273,7 +297,7 @@ async def unlock_button(client, callback_query: CallbackQuery):
     if user_refs >= req_shares:
         await callback_query.answer() # Fast Response
         success_btn = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Enter Group / Channel", url=batch_data['unlock_link'])]])
-        await callback_query.edit_message_text(f"🎉 **Congratulations!**\nBatch Unlocked successfully. Click below to join:", reply_markup=success_btn)
+        await safe_edit(callback_query, f"🎉 **Congratulations!**\nBatch Unlocked successfully. Click below to join:", reply_markup=success_btn)
     else:
         remaining = req_shares - user_refs
         # Clean specific message without 1/5 logic
@@ -325,7 +349,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
             f"📋 **Batch-wise Activity:**\n{batch_stats if batch_stats else 'No active batches'}"
         )
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]])
-        await callback_query.edit_message_text(text, reply_markup=btn)
+        await safe_edit(callback_query, text, reply_markup=btn)
 
     elif data == "admin_batches":
         await callback_query.answer()
@@ -334,7 +358,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         for b in batches:
             buttons.append([InlineKeyboardButton(f"📦 Batch: {b['batch_id']}", callback_data=f"admin_viewbatch_{b['batch_id']}")])
         buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")])
-        await callback_query.edit_message_text("📦 **Manage Batches**\nSelect a batch to view details:", reply_markup=InlineKeyboardMarkup(buttons))
+        await safe_edit(callback_query, "📦 **Manage Batches**\nSelect a batch to view details:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("admin_viewbatch_"):
         await callback_query.answer()
@@ -362,7 +386,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
             [InlineKeyboardButton("🗑 Delete Batch", callback_data=f"admin_delbatch_{batch_id}")],
             [InlineKeyboardButton("🔙 Back to Batches", callback_data="admin_batches")]
         ])
-        await callback_query.edit_message_text(text, reply_markup=btn)
+        await safe_edit(callback_query, text, reply_markup=btn)
         
     # --- New: Button Style Editors ---
     elif data.startswith("admin_btnstyles_"):
@@ -374,7 +398,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
             [InlineKeyboardButton("💎 Buy VIP+ Button", callback_data=f"btnselect_vip_{batch_id}")],
             [InlineKeyboardButton("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}")]
         ])
-        await callback_query.edit_message_text(f"🎨 **Edit Button Styles for {batch_id}**\n\nकिस बटन का स्टाइल/कलर बदलना है?", reply_markup=btn)
+        await safe_edit(callback_query, f"🎨 **Edit Button Styles for {batch_id}**\n\nकिस बटन का स्टाइल/कलर बदलना है?", reply_markup=btn)
 
     elif data.startswith("btnselect_"):
         await callback_query.answer()
@@ -383,10 +407,10 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
             [InlineKeyboardButton("🔵 Primary", callback_data=f"setstyle_{btn_type}_primary_{batch_id}")],
             [InlineKeyboardButton("🟢 Success (Green)", callback_data=f"setstyle_{btn_type}_success_{batch_id}")],
             [InlineKeyboardButton("🔴 Danger (Red)", callback_data=f"setstyle_{btn_type}_danger_{batch_id}")],
-            [InlineKeyboardButton("⚪️ Default (Grey)", callback_data=f"setstyle_{btn_type}_default_{batch_id}")],
+            [InlineKeyboardButton("⚪️ Default (Grey)", callback_data=f"setstyle_{btn_type}_secondary_{batch_id}")],
             [InlineKeyboardButton("🔙 Back", callback_data=f"admin_btnstyles_{batch_id}")]
         ])
-        await callback_query.edit_message_text(f"🎨 **Select Style for '{btn_type.capitalize()}' Button:**", reply_markup=btn)
+        await safe_edit(callback_query, f"🎨 **Select Style for '{btn_type.capitalize()}' Button:**", reply_markup=btn)
 
     elif data.startswith("setstyle_"):
         _, btn_type, style, batch_id = data.split("_", 3)
@@ -394,35 +418,35 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         await batches_col.update_one({"batch_id": batch_id}, {"$set": {db_field: style}})
         await callback_query.answer(f"Style updated to {style.capitalize()}!", show_alert=True)
         
-        # Return to styles menu
+        # Return to styles menu dynamically to prevent freezing
         btn = InlineKeyboardMarkup([
             [InlineKeyboardButton("📤 Share Button", callback_data=f"btnselect_share_{batch_id}")],
             [InlineKeyboardButton("🔓 Unlock Button", callback_data=f"btnselect_unlock_{batch_id}")],
             [InlineKeyboardButton("💎 Buy VIP+ Button", callback_data=f"btnselect_vip_{batch_id}")],
             [InlineKeyboardButton("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}")]
         ])
-        await callback_query.edit_message_text(f"🎨 **Edit Button Styles for {batch_id}**\n\nकिस बटन का स्टाइल बदलना है?", reply_markup=btn)
+        await safe_edit(callback_query, f"✅ **{btn_type.capitalize()}** Button set to **{style.capitalize()}**\n\n🎨 **Edit Button Styles for {batch_id}**\n\nकिस बटन का स्टाइल बदलना है?", reply_markup=btn)
 
     elif data.startswith("editlink_"):
         await callback_query.answer()
         batch_id = data.split("_")[1]
         admin_states[user_id] = {"action": "edit_batch_link", "batch_id": batch_id}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"admin_viewbatch_{batch_id}")]])
-        await callback_query.edit_message_text(f"🔗 **Edit Unlock Link for {batch_id}**\n\n👉 Send the new Unlock Link (You can use @username):", reply_markup=btn)
+        await safe_edit(callback_query, f"🔗 **Edit Unlock Link for {batch_id}**\n\n👉 Send the new Unlock Link (You can use @username):", reply_markup=btn)
 
     elif data.startswith("editvip_"):
         await callback_query.answer()
         batch_id = data.split("_")[1]
         admin_states[user_id] = {"action": "edit_batch_vip", "batch_id": batch_id}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"admin_viewbatch_{batch_id}")]])
-        await callback_query.edit_message_text(f"💎 **Edit Buy VIP+ Link for {batch_id}**\n\n👉 Send the new Buy VIP+ direct link or @username:", reply_markup=btn)
+        await safe_edit(callback_query, f"💎 **Edit Buy VIP+ Link for {batch_id}**\n\n👉 Send the new Buy VIP+ direct link or @username:", reply_markup=btn)
 
     elif data.startswith("editreq_"):
         await callback_query.answer()
         batch_id = data.split("_")[1]
         admin_states[user_id] = {"action": "edit_batch_req", "batch_id": batch_id}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"admin_viewbatch_{batch_id}")]])
-        await callback_query.edit_message_text(f"👥 **Edit Shares for {batch_id}**\n\n👉 Send the new Share Count (Numbers only):", reply_markup=btn)
+        await safe_edit(callback_query, f"👥 **Edit Shares for {batch_id}**\n\n👉 Send the new Share Count (Numbers only):", reply_markup=btn)
 
     elif data.startswith("admin_delbatch_"):
         batch_id = data.split("_")[2]
@@ -436,7 +460,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
             [InlineKeyboardButton("📢 Broadcast to ALL Users", callback_data="admin_bcast_all")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]
         ])
-        await callback_query.edit_message_text("📢 **Broadcast Menu**\n\nChoose target audience. For specific batch, go to 'Manage Batches'.", reply_markup=btn)
+        await safe_edit(callback_query, "📢 **Broadcast Menu**\n\nChoose target audience. For specific batch, go to 'Manage Batches'.", reply_markup=btn)
 
     elif data.startswith("admin_bcast_"):
         await callback_query.answer()
@@ -444,14 +468,14 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         admin_states[user_id] = {"action": "broadcast", "target": target}
         
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
-        await callback_query.edit_message_text(f"📝 **Broadcast Mode Active**\n\nTarget: **{target}**\n\n👉 Now send the message (Text, Photo, Video) you want to broadcast.", reply_markup=btn)
+        await safe_edit(callback_query, f"📝 **Broadcast Mode Active**\n\nTarget: **{target}**\n\n👉 Now send the message (Text, Photo, Video) you want to broadcast.", reply_markup=btn)
 
     # --- Batch Creation (4 Steps with VIP) ---
     elif data == "add_batch_start":
         await callback_query.answer()
         admin_states[user_id] = {"action": "add_batch_name"}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
-        await callback_query.edit_message_text("➕ **Create New Batch (Step 1/4)**\n\n👉 Send the **Name / ID** of the batch (e.g. `Movie1`, `BatchA`):", reply_markup=btn)
+        await safe_edit(callback_query, "➕ **Create New Batch (Step 1/4)**\n\n👉 Send the **Name / ID** of the batch (e.g. `Movie1`, `BatchA`):", reply_markup=btn)
 
     # --- Multiple Settings UI ---
     elif data == "admin_settings":
@@ -468,13 +492,13 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
             [InlineKeyboardButton("🗑 Remove FSub Channel", callback_data="remove_fsub_menu")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]
         ])
-        await callback_query.edit_message_text(text, reply_markup=btn)
+        await safe_edit(callback_query, text, reply_markup=btn)
         
     elif data == "add_fsub_start":
         await callback_query.answer()
         admin_states[user_id] = {"action": "add_fsub_id"}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_settings")]])
-        await callback_query.edit_message_text("👉 Send the new **Telegram FSub Channel ID or Username** (e.g., `-10012345678` or `@mychannel`):\n*(Note: बोट को इस चैनल में एडमिन होना ज़रूरी है)*", reply_markup=btn)
+        await safe_edit(callback_query, "👉 Send the new **Telegram FSub Channel ID or Username** (e.g., `-10012345678` or `@mychannel`):\n*(Note: बोट को इस चैनल में एडमिन होना ज़रूरी है)*", reply_markup=btn)
         
     elif data == "remove_fsub_menu":
         await callback_query.answer()
@@ -488,7 +512,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
             buttons.append([InlineKeyboardButton(f"❌ Remove Channel {idx+1} ({f['id']})", callback_data=f"del_fsub_{idx}")])
         buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_settings")])
         
-        await callback_query.edit_message_text("🗑 **Select FSub channel to remove:**", reply_markup=InlineKeyboardMarkup(buttons))
+        await safe_edit(callback_query, "🗑 **Select FSub channel to remove:**", reply_markup=InlineKeyboardMarkup(buttons))
         
     elif data.startswith("del_fsub_"):
         idx = int(data.split("_")[2])
@@ -510,7 +534,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
             [InlineKeyboardButton("🗑 Remove FSub Channel", callback_data="remove_fsub_menu")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]
         ])
-        await callback_query.edit_message_text(text, reply_markup=btn)
+        await safe_edit(callback_query, text, reply_markup=btn)
 
 # --- 9. STATE MACHINE (Handles text inputs) ---
 @app.on_message(filters.private & filters.user(ADMINS) & ~filters.command(["start"]))
@@ -604,8 +628,8 @@ async def admin_state_machine(client, message: Message):
                 "unlock_link": data["unlock_link"],
                 "vip_link": vip_link,
                 "style_share": "primary", # Default Styles at batch creation
-                "style_unlock": "primary",
-                "style_vip": "primary"
+                "style_unlock": "secondary",
+                "style_vip": "success"
             }},
             upsert=True
         )
