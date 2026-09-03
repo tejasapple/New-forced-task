@@ -20,7 +20,8 @@ users_col = db["users"]
 batches_col = db["batches"]
 settings_col = db["settings"] 
 
-admin_states = {} # Admin states track करने के लिए (e.g. Broadcasting)
+# Admin states ट्रैक करने के लिए (UI Inputs के लिए)
+admin_states = {} 
 
 async def init_settings():
     if not await settings_col.find_one({"_id": "config"}):
@@ -31,11 +32,31 @@ async def init_settings():
             "fsub_link": "https://t.me/YourChannel"
         })
 
-# --- 3. Force Subscribe Checker ---
+# --- 3. UI Admin Panel Helper ---
+async def send_admin_panel(message_or_callback):
+    btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add New Batch", callback_data="add_batch_start")],
+        [InlineKeyboardButton("📦 Manage Batches", callback_data="admin_batches"),
+         InlineKeyboardButton("📊 Live Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_bcast_menu")],
+        [InlineKeyboardButton("⚙️ Bot Settings (FSub/VIP)", callback_data="admin_settings")]
+    ])
+    text = "🛠 **Admin Control Panel**\n\nस्वागत है! यहाँ से आप पूरे बोट को बिना कोई कमांड टाइप किए कंट्रोल कर सकते हैं। नीचे दिए गए बटनों का इस्तेमाल करें:"
+    
+    if isinstance(message_or_callback, Message):
+        await message_or_callback.reply_text(text, reply_markup=btn)
+    else:
+        await message_or_callback.edit_message_text(text, reply_markup=btn)
+
+# --- 4. Strict Telegram Force Subscribe Checker ---
 async def check_fsub(client, user_id):
+    if user_id in ADMINS:
+        return True # Admin bypass
+    
     config = await settings_col.find_one({"_id": "config"})
     fsub_channel = config.get("fsub_channel")
     
+    # अगर चैनल सेट नहीं है, तो ट्रू रिटर्न करे
     if not fsub_channel or fsub_channel == "-100XXXXXXXXX":
         return True 
 
@@ -45,16 +66,23 @@ async def check_fsub(client, user_id):
     except UserNotParticipant:
         return False
     except Exception as e:
-        print(f"FSub Error: {e}") 
+        # अगर कोई और एरर आता है (जैसे बोट चैनल में एडमिन नहीं है)
+        print(f"FSub Error: {e}")
         return True 
 
-# --- 4. Start & FSub / Referral Logic ---
+# --- 5. Start & Referral Logic ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     user_id = message.from_user.id
     args = message.text.split(" ")
     
-    # 1. User Database Entry (Upgraded with joined_batches tracking)
+    # 🌟 Auto Detect Admin & Open Panel
+    if user_id in ADMINS and len(args) == 1:
+        if user_id in admin_states:
+            del admin_states[user_id] # Clear previous stuck states
+        return await send_admin_panel(message)
+
+    # 1. Normal User DB Entry
     user_data = await users_col.find_one({"user_id": user_id})
     if not user_data:
         user_data = {"user_id": user_id, "is_banned": False, "total_referrals": 0, "referred_by": None, "batches": {}, "joined_batches": []}
@@ -63,18 +91,18 @@ async def start_command(client, message):
     if user_data.get("is_banned"):
         return await message.reply_text("🚫 You are banned from using this bot.")
 
-    # 2. Force Subscribe Check
+    # 2. Strict Force Subscribe Check (Telegram)
     is_joined = await check_fsub(client, user_id)
     if not is_joined:
         config = await settings_col.find_one({"_id": "config"})
         btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Join Channel (जरुरी है)", url=config["fsub_link"])],
+            [InlineKeyboardButton("📢 Join Main Channel (ज़रूरी है)", url=config["fsub_link"])],
             [InlineKeyboardButton("✅ I have Joined", url=f"https://t.me/{(await app.get_me()).username}?start={args[1] if len(args) > 1 else ''}")]
         ])
-        return await message.reply_text("🚨 **पहले हमारे मेन चैनल को ज्वाइन करें!**\nचैनल ज्वाइन करने के बाद ही आप बोट का इस्तेमाल कर पाएंगे।", reply_markup=btn)
+        return await message.reply_text("🚨 **पहले हमारे मेन टेलीग्राम चैनल को ज्वाइन करें!**\nचैनल ज्वाइन किए बिना आप लिंक्स अनलॉक नहीं कर पाएंगे।", reply_markup=btn)
 
     if len(args) == 1:
-        return await message.reply_text("Welcome! Please use a valid batch link to start.")
+        return await message.reply_text("👋 Welcome! Please use a valid batch link to start.")
 
     # 3. Handle Batch ID and Referral
     start_data = args[1] 
@@ -92,94 +120,80 @@ async def start_command(client, message):
         else:
             batch_id = start_data
 
-        # 4. Fetch Batch Data & Isolate User
         batch_info = await batches_col.find_one({"batch_id": batch_id})
         if not batch_info:
             return await message.reply_text("❌ This batch does not exist or has expired.")
 
-        # Update that this user interacted with this specific batch (for batch broadcasting)
         await users_col.update_one({"user_id": user_id}, {"$addToSet": {"joined_batches": batch_id}})
 
         eng_text, hin_text = batch_info['eng_text'], batch_info['hin_text']
         bot_username = (await app.get_me()).username
-        share_url = f"https://t.me/share/url?url=https://t.me/{bot_username}?start={batch_id}_{user_id}&text=Join%20this%20awesome%20group!"
+        share_url = f"https://t.me/share/url?url=https://t.me/{bot_username}?start={batch_id}_{user_id}&text=Unlock%20this%20exclusive%20group!"
 
         buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Share with friends", url=share_url)],
-            [InlineKeyboardButton(f"🔓 Unlock {batch_id}", callback_data=f"unlock_{batch_id}")],
+            [InlineKeyboardButton(f"📤 Share with {batch_info['req_shares']} friends to Unlock", url=share_url)],
+            [InlineKeyboardButton(f"🔓 Unlock Batch", callback_data=f"unlock_{batch_id}")],
             [InlineKeyboardButton("💎 Buy VIP (Direct Access)", callback_data="buy_vip")]
         ])
 
         await message.reply_text(f"{eng_text}\n\n{hin_text}", reply_markup=buttons)
-
     except Exception as e:
         await message.reply_text("❌ Invalid Link Format.")
 
-# --- 5. Callbacks (Unlock & VIP) ---
+# --- 6. Normal User Callbacks (Unlock & VIP) ---
 @app.on_callback_query(filters.regex(r"^unlock_"))
 async def unlock_button(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     batch_id = callback_query.data.split("_")[1]
 
     if not await check_fsub(client, user_id):
-        return await callback_query.answer("❌ पहले चैनल ज्वाइन करें!", show_alert=True)
+        return await callback_query.answer("❌ पहले टेलीग्राम चैनल ज्वाइन करें!", show_alert=True)
 
     user_data = await users_col.find_one({"user_id": user_id})
     batch_data = await batches_col.find_one({"batch_id": batch_id})
     
     if not batch_data:
-        return await callback_query.answer("Batch Expired!", show_alert=True)
+        return await callback_query.answer("Batch Expired or Removed!", show_alert=True)
 
     req_shares = batch_data['req_shares']
     user_refs = user_data.get("batches", {}).get(batch_id, 0)
 
     if user_refs >= req_shares:
-        success_btn = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Enter {batch_id} Group", url=batch_data['unlock_link'])]])
-        await callback_query.edit_message_text(f"🎉 **Congratulations!** {batch_id} Unlocked successfully!", reply_markup=success_btn)
+        success_btn = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Enter Group / Channel", url=batch_data['unlock_link'])]])
+        await callback_query.edit_message_text(f"🎉 **Congratulations!**\nBatch Unlocked successfully. Click below to join:", reply_markup=success_btn)
     else:
         remaining = req_shares - user_refs
-        await callback_query.answer(f"❌ Denied!\nYou have {user_refs}/{req_shares} shares for this batch.\nYou need {remaining} more.", show_alert=True)
+        await callback_query.answer(f"❌ Denied!\nYou have {user_refs}/{req_shares} shares.\nYou need {remaining} more shares to unlock.", show_alert=True)
 
 @app.on_callback_query(filters.regex(r"^buy_vip$"))
 async def vip_button(client, callback_query: CallbackQuery):
     config = await settings_col.find_one({"_id": "config"})
     vip_link = config.get("vip_link", "Contact Admin")
-    
-    vip_btn = InlineKeyboardMarkup([[InlineKeyboardButton("👑 Go to VIP Group", url=vip_link)]])
-    await callback_query.edit_message_text("🌟 **VIP Access**\n\nClick below to access the VIP section directly without sharing!", reply_markup=vip_btn)
+    vip_btn = InlineKeyboardMarkup([[InlineKeyboardButton("👑 Go to VIP Area", url=vip_link)]])
+    await callback_query.edit_message_text("🌟 **VIP Access**\n\nClick below to access directly without sharing!", reply_markup=vip_btn)
 
 
 # ==========================================
-# --- 6. NEW ADMIN UI & DASHBOARD SYSTEM ---
+# --- 7. NEW BUTTON-BASED ADMIN SYSTEM ---
 # ==========================================
 
-@app.on_message(filters.command("admin") & filters.user(ADMINS))
-async def admin_panel(client, message):
-    btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Live Stats", callback_data="admin_stats"),
-         InlineKeyboardButton("📦 Manage Batches", callback_data="admin_batches")],
-        [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_bcast_menu")],
-        [InlineKeyboardButton("⚙️ Settings Help", callback_data="admin_settings")]
-    ])
-    await message.reply_text("🛠 **Admin Control Panel**\nWelcome to your dashboard. Select an option:", reply_markup=btn)
-
-@app.on_callback_query(filters.regex(r"^admin_"))
+@app.on_callback_query(filters.regex(r"^admin_") | filters.regex(r"^add_batch_start$") | filters.regex(r"^set_"))
 async def admin_callbacks(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    if user_id not in ADMINS:
+        return await callback_query.answer("You are not an admin!", show_alert=True)
+
     data = callback_query.data
 
     if data == "admin_panel":
-        btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Live Stats", callback_data="admin_stats"),
-             InlineKeyboardButton("📦 Manage Batches", callback_data="admin_batches")],
-            [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_bcast_menu")],
-            [InlineKeyboardButton("⚙️ Settings Help", callback_data="admin_settings")]
-        ])
-        await callback_query.edit_message_text("🛠 **Admin Control Panel**\nWelcome to your dashboard. Select an option:", reply_markup=btn)
+        if user_id in admin_states:
+            del admin_states[user_id] # Clear states on returning to home
+        await send_admin_panel(callback_query)
 
     elif data == "admin_stats":
         total_users = await users_col.count_documents({})
         total_batches = await batches_col.count_documents({})
-        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]])
         await callback_query.edit_message_text(f"📊 **Live Stats Dashboard**\n\n👥 Total Users: {total_users}\n📦 Active Batches: {total_batches}", reply_markup=btn)
 
     elif data == "admin_batches":
@@ -187,138 +201,187 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         buttons = []
         for b in batches:
             buttons.append([InlineKeyboardButton(f"📦 Batch: {b['batch_id']}", callback_data=f"admin_viewbatch_{b['batch_id']}")])
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
-        
-        await callback_query.edit_message_text("📦 **Select a Batch to manage:**\n*(To add a new batch, use /addbatch command)*", reply_markup=InlineKeyboardMarkup(buttons))
+        buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")])
+        await callback_query.edit_message_text("📦 **Manage Batches**\nSelect a batch to view details:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("admin_viewbatch_"):
         batch_id = data.split("_")[2]
         b = await batches_col.find_one({"batch_id": batch_id})
         bot_username = (await app.get_me()).username
-        
-        # Count users who interacted with this batch
         batch_users = await users_col.count_documents({"joined_batches": batch_id})
         
         text = (f"🔍 **Batch Details: {batch_id}**\n\n"
                 f"👥 Users in this batch: {batch_users}\n"
                 f"🎯 Req Shares: {b['req_shares']}\n"
                 f"🔗 Unlock Link: {b['unlock_link']}\n"
-                f"🚀 Master Link: `https://t.me/{bot_username}?start={batch_id}`")
+                f"🚀 **Direct Link:** `https://t.me/{bot_username}?start={batch_id}`")
         
         btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Broadcast ONLY to this Batch", callback_data=f"admin_bcast_{batch_id}")],
+            [InlineKeyboardButton("📢 Broadcast to this Batch", callback_data=f"admin_bcast_{batch_id}")],
+            [InlineKeyboardButton("🗑 Delete Batch", callback_data=f"admin_delbatch_{batch_id}")],
             [InlineKeyboardButton("🔙 Back to Batches", callback_data="admin_batches")]
         ])
         await callback_query.edit_message_text(text, reply_markup=btn)
+        
+    elif data.startswith("admin_delbatch_"):
+        batch_id = data.split("_")[2]
+        await batches_col.delete_one({"batch_id": batch_id})
+        await callback_query.answer("Batch Deleted Successfully!", show_alert=True)
+        await send_admin_panel(callback_query)
 
     elif data == "admin_bcast_menu":
         btn = InlineKeyboardMarkup([
             [InlineKeyboardButton("📢 Broadcast to ALL Users", callback_data="admin_bcast_all")],
-            [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]
         ])
-        await callback_query.edit_message_text("📢 **Broadcast Menu**\n\nChoose target audience. For specific batch, go to 'Manage Batches' and select a batch.", reply_markup=btn)
+        await callback_query.edit_message_text("📢 **Broadcast Menu**\n\nChoose target audience. For specific batch, go to 'Manage Batches'.", reply_markup=btn)
 
     elif data.startswith("admin_bcast_"):
         target = data.replace("admin_bcast_", "")
-        admin_id = callback_query.from_user.id
-        admin_states[admin_id] = {"action": "broadcast", "target": target}
+        admin_states[user_id] = {"action": "broadcast", "target": target}
         
-        target_name = "ALL USERS" if target == "all" else f"BATCH: {target}"
-        await callback_query.edit_message_text(f"📝 **Broadcast Mode Active**\n\nTarget: **{target_name}**\n\n👉 Now send the message (Text, Photo, Video) you want to broadcast.\n\nSend /cancel to abort.")
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        await callback_query.edit_message_text(f"📝 **Broadcast Mode Active**\n\nTarget: **{target}**\n\n👉 Now send the message (Text, Photo, Video) you want to broadcast.", reply_markup=btn)
 
+    # --- UI Based Batch Creation Trigger ---
+    elif data == "add_batch_start":
+        admin_states[user_id] = {"action": "add_batch_name"}
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        await callback_query.edit_message_text("➕ **Create New Batch (Step 1/5)**\n\n👉 Send the **Name / ID** of the batch (e.g. `Movie1`, `BatchA`):", reply_markup=btn)
+
+    # --- Settings UI ---
     elif data == "admin_settings":
-        text = ("⚙️ **Settings Help & Commands**\n\n"
-                "• Add Batch:\n`/addbatch name | req | link | eng | hin`\n"
-                "• Set VIP:\n`/setvip https://link`\n"
-                "• Set FSub:\n`/setfsub -100123 https://link`\n"
-                "• Ban/Unban:\n`/ban UserID` & `/unban UserID`")
-        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+        config = await settings_col.find_one({"_id": "config"})
+        text = (f"⚙️ **Bot Settings**\n\n"
+                f"**Current FSub ID:** `{config.get('fsub_channel')}`\n"
+                f"**Current FSub Link:** {config.get('fsub_link')}\n"
+                f"**Current VIP Link:** {config.get('vip_link')}\n\n"
+                "क्या चेंज करना है चुनें:")
+        btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔧 Set FSub Channel ID", callback_data="set_fsub_id")],
+            [InlineKeyboardButton("🔗 Set FSub Link", callback_data="set_fsub_link")],
+            [InlineKeyboardButton("💎 Set VIP Link", callback_data="set_vip_link")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]
+        ])
         await callback_query.edit_message_text(text, reply_markup=btn)
-
-# --- 7. Broadcast Message Receiver Logic ---
-@app.on_message(filters.private & filters.user(ADMINS), group=1)
-async def broadcast_receiver(client, message: Message):
-    admin_id = message.from_user.id
-    
-    if admin_id in admin_states and admin_states[admin_id].get("action") == "broadcast":
-        if message.text == "/cancel":
-            del admin_states[admin_id]
-            return await message.reply_text("✅ Broadcast cancelled.")
         
-        target = admin_states[admin_id]["target"]
-        del admin_states[admin_id] # State clear karein
+    elif data == "set_fsub_id":
+        admin_states[user_id] = {"action": "set_fsub_id"}
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        await callback_query.edit_message_text("👉 Send the new **Telegram FSub Channel ID** (e.g., `-10012345678`):\n*(Note: बोट को इस चैनल में एडमिन होना ज़रूरी है)*", reply_markup=btn)
+        
+    elif data == "set_fsub_link":
+        admin_states[user_id] = {"action": "set_fsub_link"}
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        await callback_query.edit_message_text("👉 Send the new **Telegram Channel Invite Link**:", reply_markup=btn)
+
+    elif data == "set_vip_link":
+        admin_states[user_id] = {"action": "set_vip_link"}
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        await callback_query.edit_message_text("👉 Send the new **VIP Direct Link**:", reply_markup=btn)
+
+
+# --- 8. STATE MACHINE (Handles all text inputs from Admin) ---
+@app.on_message(filters.private & filters.user(ADMINS) & ~filters.command(["start"]))
+async def admin_state_machine(client, message: Message):
+    admin_id = message.from_user.id
+    if admin_id not in admin_states:
+        return # अगर एडमिन ने कोई बटन नहीं दबाया है, तो इग्नोर करो
+
+    state_info = admin_states[admin_id]
+    action = state_info.get("action")
+    
+    # --- Broadcast Logic ---
+    if action == "broadcast":
+        target = state_info["target"]
+        del admin_states[admin_id] # State clear
         
         await message.reply_text("🚀 Broadcast is starting... Please wait.")
-        
-        if target == "all":
-            users = await users_col.find().to_list(length=None)
-        else:
-            users = await users_col.find({"joined_batches": target}).to_list(length=None)
+        users = await users_col.find().to_list(length=None) if target == "all" else await users_col.find({"joined_batches": target}).to_list(length=None)
         
         success, failed = 0, 0
         for u in users:
             try:
                 await message.copy(u["user_id"])
                 success += 1
-                await asyncio.sleep(0.05) # Rate limit protection
-            except Exception:
+                await asyncio.sleep(0.05)
+            except:
                 failed += 1
                 
-        await message.reply_text(f"✅ **Broadcast Completed!**\n🎯 Target: {target}\n📩 Sent: {success}\n❌ Failed: {failed}")
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]])
+        return await message.reply_text(f"✅ **Broadcast Completed!**\n🎯 Target: {target}\n📩 Sent: {success}\n❌ Failed: {failed}", reply_markup=btn)
 
+    # --- Add Batch Logic (Step-by-Step) ---
+    if action == "add_batch_name":
+        admin_states[admin_id]["batch_id"] = message.text.replace(" ", "_")
+        admin_states[admin_id]["action"] = "add_batch_req"
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        await message.reply_text("🎯 **(Step 2/5)**\nकितने रेफ़रल चाहिए इस बैच को अनलॉक करने के लिए? (सिर्फ नंबर लिखें, जैसे: `5`)", reply_markup=btn)
+        
+    elif action == "add_batch_req":
+        if not message.text.isdigit():
+            return await message.reply_text("❌ Please send a valid number (e.g. 5)")
+        admin_states[admin_id]["req_shares"] = int(message.text)
+        admin_states[admin_id]["action"] = "add_batch_link"
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        await message.reply_text("🔗 **(Step 3/5)**\nअनलॉक होने के बाद यूज़र को कौन सा लिंक मिलना चाहिए? (यहाँ लिंक भेजें)", reply_markup=btn)
 
-# --- 8. Old Essential Admin Commands (Intact) ---
-@app.on_message(filters.command("setvip") & filters.user(ADMINS))
-async def set_vip(client, message):
-    if len(message.command) < 2: return await message.reply_text("Use: `/setvip link`")
-    new_link = message.command[1]
-    await settings_col.update_one({"_id": "config"}, {"$set": {"vip_link": new_link}}, upsert=True)
-    await message.reply_text(f"✅ VIP Link updated.")
+    elif action == "add_batch_link":
+        admin_states[admin_id]["unlock_link"] = message.text
+        admin_states[admin_id]["action"] = "add_batch_eng"
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        await message.reply_text("🇺🇸 **(Step 4/5)**\nइस बैच के लिए English प्रमोशनल मैसेज भेजें:", reply_markup=btn)
+        
+    elif action == "add_batch_eng":
+        admin_states[admin_id]["eng_text"] = message.text
+        admin_states[admin_id]["action"] = "add_batch_hin"
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        await message.reply_text("🇮🇳 **(Step 5/5)**\nअब इस बैच के लिए Hindi प्रमोशनल मैसेज भेजें:", reply_markup=btn)
 
-@app.on_message(filters.command("setfsub") & filters.user(ADMINS))
-async def set_fsub(client, message):
-    args = message.text.split(" ")
-    if len(args) < 3: return await message.reply_text("Use: `/setfsub -100ID Link`")
-    await settings_col.update_one({"_id": "config"}, {"$set": {"fsub_channel": args[1], "fsub_link": args[2]}}, upsert=True)
-    await message.reply_text(f"✅ FSub updated!")
-
-@app.on_message(filters.command("ban") & filters.user(ADMINS))
-async def ban_user(client, message):
-    if len(message.command) < 2: return
-    await users_col.update_one({"user_id": int(message.command[1])}, {"$set": {"is_banned": True}})
-    await message.reply_text(f"🚫 Banned.")
-
-@app.on_message(filters.command("unban") & filters.user(ADMINS))
-async def unban_user(client, message):
-    if len(message.command) < 2: return
-    await users_col.update_one({"user_id": int(message.command[1])}, {"$set": {"is_banned": False}})
-    await message.reply_text(f"✅ Unbanned.")
-
-@app.on_message(filters.command("addbatch") & filters.user(ADMINS))
-async def add_batch(client, message):
-    try:
-        data = message.text.split("|")
-        batch_id = data[0].split(" ")[1].strip()
-        req_shares = int(data[1].strip())
-        unlock_link = data[2].strip()
-        eng, hin = data[3].strip(), data[4].strip()
-
+    elif action == "add_batch_hin":
+        # Final Step - Save to Database
+        admin_states[admin_id]["hin_text"] = message.text
+        data = admin_states[admin_id]
+        batch_id = data["batch_id"]
+        
         await batches_col.update_one(
             {"batch_id": batch_id},
-            {"$set": {"eng_text": eng, "hin_text": hin, "unlock_link": unlock_link, "req_shares": req_shares}},
+            {"$set": {
+                "req_shares": data["req_shares"],
+                "unlock_link": data["unlock_link"],
+                "eng_text": data["eng_text"],
+                "hin_text": data["hin_text"]
+            }},
             upsert=True
         )
+        del admin_states[admin_id] # Clear state
         bot_username = (await app.get_me()).username
-        await message.reply_text(f"✅ Batch '{batch_id}' added!\n🔗 Link: `https://t.me/{bot_username}?start={batch_id}`\n\n👉 Now you can view this in /admin panel.")
-    except Exception as e:
-        await message.reply_text("❌ Error. Format:\n`/addbatch name | 5 | link | eng | hin`")
+        link = f"https://t.me/{bot_username}?start={batch_id}"
+        
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]])
+        await message.reply_text(f"✅ **Batch '{batch_id}' Successfully Created!**\n\n🎯 Req Shares: {data['req_shares']}\n🚀 **Direct Batch Link:**\n`{link}`\n\nइस लिंक को आप सीधे भी शेयर कर सकते हैं।", reply_markup=btn)
 
-@app.on_message(filters.command("stats") & filters.user(ADMINS))
-async def get_stats(client, message):
-    await admin_panel(client, message) # Route to new UI
+    # --- Settings Logic ---
+    elif action == "set_fsub_id":
+        await settings_col.update_one({"_id": "config"}, {"$set": {"fsub_channel": message.text}}, upsert=True)
+        del admin_states[admin_id]
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_settings")]])
+        await message.reply_text("✅ FSub Channel ID Updated!", reply_markup=btn)
+        
+    elif action == "set_fsub_link":
+        await settings_col.update_one({"_id": "config"}, {"$set": {"fsub_link": message.text}}, upsert=True)
+        del admin_states[admin_id]
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_settings")]])
+        await message.reply_text("✅ FSub Link Updated!", reply_markup=btn)
+
+    elif action == "set_vip_link":
+        await settings_col.update_one({"_id": "config"}, {"$set": {"vip_link": message.text}}, upsert=True)
+        del admin_states[admin_id]
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_settings")]])
+        await message.reply_text("✅ VIP Link Updated!", reply_markup=btn)
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_settings()) 
-    print("🚀 Ultra-Fast FSub Referral Bot with UI is starting...")
+    print("🚀 Fully Automated Telegram Admin UI Bot is starting...")
     app.run()
