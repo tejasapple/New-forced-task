@@ -38,6 +38,24 @@ def format_telegram_link(link: str) -> str:
         return f"https://t.me/{link[1:]}"
     return link
 
+# --- Helper Function for Styled Buttons (Kurigram Support) ---
+def create_btn(text, callback_data=None, url=None, style="primary"):
+    """
+    यह फंक्शन सेफली बटन बनाता है। अगर आप Kurigram इस्तेमाल कर रहे हैं,
+    तो यह style अप्लाई करेगा, वरना डिफ़ॉल्ट बटन दे देगा (बिना एरर के)।
+    """
+    kwargs = {"text": text}
+    if callback_data:
+        kwargs["callback_data"] = callback_data
+    if url:
+        kwargs["url"] = url
+    try:
+        # Kurigram/Modified Pyrogram के लिए 
+        return InlineKeyboardButton(**kwargs, style=style)
+    except TypeError:
+        # अगर नार्मल Pyrogram है तो बिना एरर के डिफ़ॉल्ट बटन बनाएगा 
+        return InlineKeyboardButton(**kwargs)
+
 # --- 3. UI Admin Panel Helper ---
 async def send_admin_panel(message_or_callback):
     btn = InlineKeyboardMarkup([
@@ -192,14 +210,19 @@ async def process_batch_start(client, message_or_callback, user_id, start_data):
             f"**नया चैनल/लिंक पाने के लिए कृपया इस बॉट को {req_shares} लोगों के साथ शेयर करें और अनलॉक पर दबाएं।**"
         )
 
+        # Dynamic Styles Fetched from DB (Default to primary)
+        style_share = batch_info.get("style_share", "primary")
+        style_unlock = batch_info.get("style_unlock", "primary")
+        style_vip = batch_info.get("style_vip", "primary")
+
         buttons = [
-            [InlineKeyboardButton(f"📤 Share with {req_shares} friends", url=share_url)],
-            [InlineKeyboardButton(f"🔓 Unlock", callback_data=f"unlock_{batch_id}")]
+            [create_btn(f"📤 Share with {req_shares} friends", url=share_url, style=style_share)],
+            [create_btn(f"🔓 Unlock", callback_data=f"unlock_{batch_id}", style=style_unlock)]
         ]
         
-        # Batch specific VIP Link Add
+        # Batch specific VIP Link Add with Dynamic Style
         if batch_info.get("vip_link") and batch_info["vip_link"] != "none":
-            buttons.append([InlineKeyboardButton("💎 VIP", url=batch_info["vip_link"])])
+            buttons.append([create_btn("💎 Buy VIP+", url=batch_info["vip_link"], style=style_vip)])
 
         if isinstance(message_or_callback, Message):
             await message_or_callback.reply_text(final_text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -260,7 +283,7 @@ async def unlock_button(client, callback_query: CallbackQuery):
 # --- 8. BUTTON-BASED ADMIN SYSTEM ---
 # ==========================================
 
-@app.on_callback_query(filters.regex(r"^admin_") | filters.regex(r"^add_batch_start$") | filters.regex(r"^edit") | filters.regex(r"^add_fsub") | filters.regex(r"^remove_fsub") | filters.regex(r"^del_fsub_"))
+@app.on_callback_query(filters.regex(r"^admin_") | filters.regex(r"^add_batch_start$") | filters.regex(r"^edit") | filters.regex(r"^add_fsub") | filters.regex(r"^remove_fsub") | filters.regex(r"^del_fsub_") | filters.regex(r"^btnselect_") | filters.regex(r"^setstyle_"))
 async def admin_callbacks(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id not in ADMINS:
@@ -327,19 +350,59 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
                 f"👥 Users in this batch: {batch_users}\n"
                 f"🎯 Req Shares: {b['req_shares']}\n"
                 f"🔗 Unlock Link: {b['unlock_link']}\n"
-                f"💎 VIP Link: {b.get('vip_link', 'Not Set')}\n\n"
+                f"💎 Buy VIP+ Link: {b.get('vip_link', 'Not Set')}\n\n"
                 f"🚀 **Direct Link:** `https://t.me/{bot_username}?start={batch_id}`")
         
         btn = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔗 Edit Unlock Link", callback_data=f"editlink_{batch_id}"),
-             InlineKeyboardButton("💎 Edit VIP Link", callback_data=f"editvip_{batch_id}")],
+             InlineKeyboardButton("💎 Edit Buy VIP+ Link", callback_data=f"editvip_{batch_id}")],
             [InlineKeyboardButton("👥 Edit Share Count", callback_data=f"editreq_{batch_id}")],
+            [InlineKeyboardButton("🎨 Edit Button Styles", callback_data=f"admin_btnstyles_{batch_id}")],
             [InlineKeyboardButton("📢 Broadcast to this Batch", callback_data=f"admin_bcast_{batch_id}")],
             [InlineKeyboardButton("🗑 Delete Batch", callback_data=f"admin_delbatch_{batch_id}")],
             [InlineKeyboardButton("🔙 Back to Batches", callback_data="admin_batches")]
         ])
         await callback_query.edit_message_text(text, reply_markup=btn)
         
+    # --- New: Button Style Editors ---
+    elif data.startswith("admin_btnstyles_"):
+        await callback_query.answer()
+        batch_id = data.split("_")[2]
+        btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Share Button", callback_data=f"btnselect_share_{batch_id}")],
+            [InlineKeyboardButton("🔓 Unlock Button", callback_data=f"btnselect_unlock_{batch_id}")],
+            [InlineKeyboardButton("💎 Buy VIP+ Button", callback_data=f"btnselect_vip_{batch_id}")],
+            [InlineKeyboardButton("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}")]
+        ])
+        await callback_query.edit_message_text(f"🎨 **Edit Button Styles for {batch_id}**\n\nकिस बटन का स्टाइल/कलर बदलना है?", reply_markup=btn)
+
+    elif data.startswith("btnselect_"):
+        await callback_query.answer()
+        _, btn_type, batch_id = data.split("_", 2)
+        btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔵 Primary", callback_data=f"setstyle_{btn_type}_primary_{batch_id}")],
+            [InlineKeyboardButton("🟢 Success (Green)", callback_data=f"setstyle_{btn_type}_success_{batch_id}")],
+            [InlineKeyboardButton("🔴 Danger (Red)", callback_data=f"setstyle_{btn_type}_danger_{batch_id}")],
+            [InlineKeyboardButton("⚪️ Default (Grey)", callback_data=f"setstyle_{btn_type}_default_{batch_id}")],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"admin_btnstyles_{batch_id}")]
+        ])
+        await callback_query.edit_message_text(f"🎨 **Select Style for '{btn_type.capitalize()}' Button:**", reply_markup=btn)
+
+    elif data.startswith("setstyle_"):
+        _, btn_type, style, batch_id = data.split("_", 3)
+        db_field = f"style_{btn_type}"
+        await batches_col.update_one({"batch_id": batch_id}, {"$set": {db_field: style}})
+        await callback_query.answer(f"Style updated to {style.capitalize()}!", show_alert=True)
+        
+        # Return to styles menu
+        btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Share Button", callback_data=f"btnselect_share_{batch_id}")],
+            [InlineKeyboardButton("🔓 Unlock Button", callback_data=f"btnselect_unlock_{batch_id}")],
+            [InlineKeyboardButton("💎 Buy VIP+ Button", callback_data=f"btnselect_vip_{batch_id}")],
+            [InlineKeyboardButton("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}")]
+        ])
+        await callback_query.edit_message_text(f"🎨 **Edit Button Styles for {batch_id}**\n\nकिस बटन का स्टाइल बदलना है?", reply_markup=btn)
+
     elif data.startswith("editlink_"):
         await callback_query.answer()
         batch_id = data.split("_")[1]
@@ -352,7 +415,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         batch_id = data.split("_")[1]
         admin_states[user_id] = {"action": "edit_batch_vip", "batch_id": batch_id}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"admin_viewbatch_{batch_id}")]])
-        await callback_query.edit_message_text(f"💎 **Edit VIP Link for {batch_id}**\n\n👉 Send the new VIP direct link or @username:", reply_markup=btn)
+        await callback_query.edit_message_text(f"💎 **Edit Buy VIP+ Link for {batch_id}**\n\n👉 Send the new Buy VIP+ direct link or @username:", reply_markup=btn)
 
     elif data.startswith("editreq_"):
         await callback_query.answer()
@@ -494,7 +557,7 @@ async def admin_state_machine(client, message: Message):
         await batches_col.update_one({"batch_id": batch_id}, {"$set": {"vip_link": new_link}})
         del admin_states[admin_id]
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}")]])
-        await message.reply_text(f"✅ VIP Link for '{batch_id}' updated!", reply_markup=btn)
+        await message.reply_text(f"✅ Buy VIP+ Link for '{batch_id}' updated!", reply_markup=btn)
 
     elif action == "edit_batch_req":
         if not message.text.isdigit():
@@ -524,10 +587,10 @@ async def admin_state_machine(client, message: Message):
         admin_states[admin_id]["unlock_link"] = format_telegram_link(message.text)
         admin_states[admin_id]["action"] = "add_batch_vip"
         btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏭ Skip VIP", callback_data="skip_vip")],
+            [InlineKeyboardButton("⏭ Skip Buy VIP+", callback_data="skip_vip")],
             [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
         ])
-        await message.reply_text("💎 **(Step 4/4)**\nइस बैच के लिए VIP डायरेक्ट लिंक भेजें। (अगर नहीं लगाना तो Skip पर क्लिक करें)", reply_markup=btn)
+        await message.reply_text("💎 **(Step 4/4)**\nइस बैच के लिए Buy VIP+ डायरेक्ट लिंक भेजें। (अगर नहीं लगाना तो Skip पर क्लिक करें)", reply_markup=btn)
 
     elif action == "add_batch_vip" or (message.text.lower() == "skip" if message.text else False):
         vip_link = format_telegram_link(message.text) if message.text and message.text.lower() != "skip" else "none"
@@ -539,7 +602,10 @@ async def admin_state_machine(client, message: Message):
             {"$set": {
                 "req_shares": data["req_shares"],
                 "unlock_link": data["unlock_link"],
-                "vip_link": vip_link
+                "vip_link": vip_link,
+                "style_share": "primary", # Default Styles at batch creation
+                "style_unlock": "primary",
+                "style_vip": "primary"
             }},
             upsert=True
         )
@@ -548,7 +614,7 @@ async def admin_state_machine(client, message: Message):
         link = f"https://t.me/{bot_username}?start={batch_id}"
         
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]])
-        await message.reply_text(f"✅ **Batch '{batch_id}' Successfully Created!**\n\n🎯 Req Shares: {data['req_shares']}\n💎 VIP: {'Yes' if vip_link != 'none' else 'No'}\n🚀 **Direct Batch Link:**\n`{link}`\n\nइस लिंक को आप सीधे भी शेयर कर सकते हैं।", reply_markup=btn)
+        await message.reply_text(f"✅ **Batch '{batch_id}' Successfully Created!**\n\n🎯 Req Shares: {data['req_shares']}\n💎 Buy VIP+: {'Yes' if vip_link != 'none' else 'No'}\n🚀 **Direct Batch Link:**\n`{link}`\n\nइस लिंक को आप सीधे भी शेयर कर सकते हैं।", reply_markup=btn)
 
     # --- Multiple FSub Settings Logic ---
     elif action == "add_fsub_id":
