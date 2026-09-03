@@ -7,9 +7,9 @@ from motor.motor_asyncio import AsyncIOMotorClient
 # --- 1. Bot Configuration ---
 API_ID = "YOUR_API_ID"
 API_HASH = "YOUR_API_HASH"
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-ADMINS = [123456789] # अपना Admin ID डालें
-MONGO_URI = "mongodb+srv://<user>:<password>@cluster.mongodb.net/?retryWrites=true&w=majority"
+BOT_TOKEN = "8686602550:AAEFJlK2QIkE5Dfi52QADj_j0EXtrU57QoI"
+ADMINS = [7121137252] # अपना Admin ID डालें
+MONGO_URI = "mongodb+srv://Mrxtejas7:Mrxtejas@cluster0.11rnf4k.mongodb.net/?appName=Cluster0"
 
 app = Client("advanced_referral_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
