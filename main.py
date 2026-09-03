@@ -61,25 +61,49 @@ async def check_fsub(client, user_id):
         return True 
 
     try:
-        await client.get_chat_member(fsub_channel, user_id)
+        # Convert to int properly if it's a numeric string like "-100..."
+        channel_id = int(fsub_channel) if str(fsub_channel).lstrip('-').isdigit() else fsub_channel
+        await client.get_chat_member(channel_id, user_id)
         return True
     except UserNotParticipant:
         return False
     except Exception as e:
-        # अगर कोई और एरर आता है (जैसे बोट चैनल में एडमिन नहीं है)
         print(f"FSub Error: {e}")
+        # अगर कोई और एरर आता है (जैसे बोट चैनल में एडमिन नहीं है), तो रोक देना बेहतर है ताकि एडमिन को पता चले
         return True 
 
-# --- 5. Start & Referral Logic ---
+# --- 5. Start & FSub Logic ---
+async def send_fsub_message(message, start_data):
+    config = await settings_col.find_one({"_id": "config"})
+    fsub_link = config.get("fsub_link", "https://t.me/YourChannel")
+    
+    text = (
+        "**Please join our update channel to use this bot.**\n\n"
+        "**बॉट का उपयोग करने के लिए कृपया हमारे अपडेट चैनल को ज्वाइन करें।**"
+    )
+    
+    # अगर स्टार्ट डेटा है तो उसे ट्राई अगेन में पास करें
+    cb_data = f"checkfsub_{start_data}" if start_data else "checkfsub_none"
+    
+    btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
+        [InlineKeyboardButton("🔄 Try Again", callback_data=cb_data)]
+    ])
+    
+    if isinstance(message, Message):
+        await message.reply_text(text, reply_markup=btn)
+    else:
+        await message.edit_message_text(text, reply_markup=btn)
+
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     user_id = message.from_user.id
     args = message.text.split(" ")
     
-    # 🌟 Auto Detect Admin & Open Panel
+    # 🌟 Auto Detect Admin & Open Panel (No parameters)
     if user_id in ADMINS and len(args) == 1:
         if user_id in admin_states:
-            del admin_states[user_id] # Clear previous stuck states
+            del admin_states[user_id] 
         return await send_admin_panel(message)
 
     # 1. Normal User DB Entry
@@ -91,22 +115,24 @@ async def start_command(client, message):
     if user_data.get("is_banned"):
         return await message.reply_text("🚫 You are banned from using this bot.")
 
-    # 2. Strict Force Subscribe Check (Telegram)
+    start_data = args[1] if len(args) > 1 else ""
+
+    # 2. Strict Force Subscribe Check (Telegram) - FSub First!
     is_joined = await check_fsub(client, user_id)
     if not is_joined:
-        config = await settings_col.find_one({"_id": "config"})
-        btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Join Main Channel (ज़रूरी है)", url=config["fsub_link"])],
-            [InlineKeyboardButton("✅ I have Joined", url=f"https://t.me/{(await app.get_me()).username}?start={args[1] if len(args) > 1 else ''}")]
-        ])
-        return await message.reply_text("🚨 **पहले हमारे मेन टेलीग्राम चैनल को ज्वाइन करें!**\nचैनल ज्वाइन किए बिना आप लिंक्स अनलॉक नहीं कर पाएंगे।", reply_markup=btn)
+        return await send_fsub_message(message, start_data)
 
-    if len(args) == 1:
-        return await message.reply_text("👋 Welcome! Please use a valid batch link to start.")
+    # 3. If Joined, Process the Batch Link
+    if start_data:
+        await process_batch_start(client, message, user_id, start_data)
+    else:
+        await message.reply_text("👋 Welcome! Please use a valid batch link to start.")
 
-    # 3. Handle Batch ID and Referral
-    start_data = args[1] 
+# --- Helper to process Batch Info ---
+async def process_batch_start(client, message_or_callback, user_id, start_data):
     try:
+        user_data = await users_col.find_one({"user_id": user_id})
+        
         if "_" in start_data:
             batch_id, referrer_id = start_data.split("_")
             referrer_id = int(referrer_id)
@@ -122,25 +148,59 @@ async def start_command(client, message):
 
         batch_info = await batches_col.find_one({"batch_id": batch_id})
         if not batch_info:
-            return await message.reply_text("❌ This batch does not exist or has expired.")
+            text = "❌ This batch does not exist or has expired."
+            if isinstance(message_or_callback, Message):
+                return await message_or_callback.reply_text(text)
+            else:
+                return await message_or_callback.edit_message_text(text)
 
         await users_col.update_one({"user_id": user_id}, {"$addToSet": {"joined_batches": batch_id}})
 
-        eng_text, hin_text = batch_info['eng_text'], batch_info['hin_text']
         bot_username = (await app.get_me()).username
         share_url = f"https://t.me/share/url?url=https://t.me/{bot_username}?start={batch_id}_{user_id}&text=Unlock%20this%20exclusive%20group!"
+        
+        req_shares = batch_info['req_shares']
+
+        # Fixed Standard Bilingual Message (No need to ask during batch setup)
+        final_text = (
+            f"**To get the new channel/link, please share this bot with {req_shares} people and click unlock.**\n\n"
+            f"**नया चैनल/लिंक पाने के लिए कृपया इस बॉट को {req_shares} लोगों के साथ शेयर करें और अनलॉक पर दबाएं।**"
+        )
 
         buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"📤 Share with {batch_info['req_shares']} friends to Unlock", url=share_url)],
-            [InlineKeyboardButton(f"🔓 Unlock Batch", callback_data=f"unlock_{batch_id}")],
+            [InlineKeyboardButton(f"📤 Share with {req_shares} friends", url=share_url)],
+            [InlineKeyboardButton(f"🔓 Unlock", callback_data=f"unlock_{batch_id}")],
             [InlineKeyboardButton("💎 Buy VIP (Direct Access)", callback_data="buy_vip")]
         ])
 
-        await message.reply_text(f"{eng_text}\n\n{hin_text}", reply_markup=buttons)
-    except Exception as e:
-        await message.reply_text("❌ Invalid Link Format.")
+        if isinstance(message_or_callback, Message):
+            await message_or_callback.reply_text(final_text, reply_markup=buttons)
+        else:
+            await message_or_callback.edit_message_text(final_text, reply_markup=buttons)
 
-# --- 6. Normal User Callbacks (Unlock & VIP) ---
+    except Exception as e:
+        print(e)
+        text = "❌ Invalid Link Format or Batch Expired."
+        if isinstance(message_or_callback, Message):
+            await message_or_callback.reply_text(text)
+        else:
+            await message_or_callback.edit_message_text(text)
+
+# --- 6. Normal User Callbacks (FSub, Unlock & VIP) ---
+@app.on_callback_query(filters.regex(r"^checkfsub_"))
+async def check_fsub_callback(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    start_data = callback_query.data.replace("checkfsub_", "")
+
+    is_joined = await check_fsub(client, user_id)
+    if not is_joined:
+        return await callback_query.answer("❌ Please join the channel first! / कृपया पहले चैनल ज्वाइन करें!", show_alert=True)
+
+    if start_data and start_data != "none":
+        await process_batch_start(client, callback_query, user_id, start_data)
+    else:
+        await callback_query.edit_message_text("👋 Welcome! Please use a valid batch link to start.")
+
 @app.on_callback_query(filters.regex(r"^unlock_"))
 async def unlock_button(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -177,7 +237,7 @@ async def vip_button(client, callback_query: CallbackQuery):
 # --- 7. NEW BUTTON-BASED ADMIN SYSTEM ---
 # ==========================================
 
-@app.on_callback_query(filters.regex(r"^admin_") | filters.regex(r"^add_batch_start$") | filters.regex(r"^set_"))
+@app.on_callback_query(filters.regex(r"^admin_") | filters.regex(r"^add_batch_start$") | filters.regex(r"^set_") | filters.regex(r"^edit"))
 async def admin_callbacks(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id not in ADMINS:
@@ -187,7 +247,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
 
     if data == "admin_panel":
         if user_id in admin_states:
-            del admin_states[user_id] # Clear states on returning to home
+            del admin_states[user_id] 
         await send_admin_panel(callback_query)
 
     elif data == "admin_stats":
@@ -207,22 +267,40 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
     elif data.startswith("admin_viewbatch_"):
         batch_id = data.split("_")[2]
         b = await batches_col.find_one({"batch_id": batch_id})
+        if not b:
+            return await callback_query.answer("Batch Not Found!", show_alert=True)
+            
         bot_username = (await app.get_me()).username
         batch_users = await users_col.count_documents({"joined_batches": batch_id})
         
         text = (f"🔍 **Batch Details: {batch_id}**\n\n"
                 f"👥 Users in this batch: {batch_users}\n"
                 f"🎯 Req Shares: {b['req_shares']}\n"
-                f"🔗 Unlock Link: {b['unlock_link']}\n"
+                f"🔗 Unlock Link: {b['unlock_link']}\n\n"
                 f"🚀 **Direct Link:** `https://t.me/{bot_username}?start={batch_id}`")
         
+        # New UI Buttons for Batch directly!
         btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 Edit Unlock Link", callback_data=f"editlink_{batch_id}"),
+             InlineKeyboardButton("👥 Edit Share Count", callback_data=f"editreq_{batch_id}")],
             [InlineKeyboardButton("📢 Broadcast to this Batch", callback_data=f"admin_bcast_{batch_id}")],
             [InlineKeyboardButton("🗑 Delete Batch", callback_data=f"admin_delbatch_{batch_id}")],
             [InlineKeyboardButton("🔙 Back to Batches", callback_data="admin_batches")]
         ])
         await callback_query.edit_message_text(text, reply_markup=btn)
         
+    elif data.startswith("editlink_"):
+        batch_id = data.split("_")[1]
+        admin_states[user_id] = {"action": "edit_batch_link", "batch_id": batch_id}
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"admin_viewbatch_{batch_id}")]])
+        await callback_query.edit_message_text(f"🔗 **Edit Link for {batch_id}**\n\n👉 Send the new Unlock Link:", reply_markup=btn)
+
+    elif data.startswith("editreq_"):
+        batch_id = data.split("_")[1]
+        admin_states[user_id] = {"action": "edit_batch_req", "batch_id": batch_id}
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"admin_viewbatch_{batch_id}")]])
+        await callback_query.edit_message_text(f"👥 **Edit Shares for {batch_id}**\n\n👉 Send the new Share Count (Numbers only):", reply_markup=btn)
+
     elif data.startswith("admin_delbatch_"):
         batch_id = data.split("_")[2]
         await batches_col.delete_one({"batch_id": batch_id})
@@ -247,7 +325,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
     elif data == "add_batch_start":
         admin_states[user_id] = {"action": "add_batch_name"}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
-        await callback_query.edit_message_text("➕ **Create New Batch (Step 1/5)**\n\n👉 Send the **Name / ID** of the batch (e.g. `Movie1`, `BatchA`):", reply_markup=btn)
+        await callback_query.edit_message_text("➕ **Create New Batch (Step 1/3)**\n\n👉 Send the **Name / ID** of the batch (e.g. `Movie1`, `BatchA`):", reply_markup=btn)
 
     # --- Settings UI ---
     elif data == "admin_settings":
@@ -286,7 +364,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
 async def admin_state_machine(client, message: Message):
     admin_id = message.from_user.id
     if admin_id not in admin_states:
-        return # अगर एडमिन ने कोई बटन नहीं दबाया है, तो इग्नोर करो
+        return 
 
     state_info = admin_states[admin_id]
     action = state_info.get("action")
@@ -294,7 +372,7 @@ async def admin_state_machine(client, message: Message):
     # --- Broadcast Logic ---
     if action == "broadcast":
         target = state_info["target"]
-        del admin_states[admin_id] # State clear
+        del admin_states[admin_id] 
         
         await message.reply_text("🚀 Broadcast is starting... Please wait.")
         users = await users_col.find().to_list(length=None) if target == "all" else await users_col.find({"joined_batches": target}).to_list(length=None)
@@ -311,12 +389,29 @@ async def admin_state_machine(client, message: Message):
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]])
         return await message.reply_text(f"✅ **Broadcast Completed!**\n🎯 Target: {target}\n📩 Sent: {success}\n❌ Failed: {failed}", reply_markup=btn)
 
-    # --- Add Batch Logic (Step-by-Step) ---
-    if action == "add_batch_name":
+    # --- Edit Specific Batch Info ---
+    elif action == "edit_batch_link":
+        batch_id = state_info["batch_id"]
+        await batches_col.update_one({"batch_id": batch_id}, {"$set": {"unlock_link": message.text}})
+        del admin_states[admin_id]
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}")]])
+        await message.reply_text(f"✅ Unlock Link for '{batch_id}' updated!", reply_markup=btn)
+
+    elif action == "edit_batch_req":
+        if not message.text.isdigit():
+            return await message.reply_text("❌ Please send a valid number.")
+        batch_id = state_info["batch_id"]
+        await batches_col.update_one({"batch_id": batch_id}, {"$set": {"req_shares": int(message.text)}})
+        del admin_states[admin_id]
+        btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}")]])
+        await message.reply_text(f"✅ Required shares for '{batch_id}' updated!", reply_markup=btn)
+
+    # --- Add Batch Logic (Shortened to 3 Steps) ---
+    elif action == "add_batch_name":
         admin_states[admin_id]["batch_id"] = message.text.replace(" ", "_")
         admin_states[admin_id]["action"] = "add_batch_req"
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
-        await message.reply_text("🎯 **(Step 2/5)**\nकितने रेफ़रल चाहिए इस बैच को अनलॉक करने के लिए? (सिर्फ नंबर लिखें, जैसे: `5`)", reply_markup=btn)
+        await message.reply_text("🎯 **(Step 2/3)**\nकितने रेफ़रल चाहिए इस बैच को अनलॉक करने के लिए? (सिर्फ नंबर लिखें, जैसे: `5`)", reply_markup=btn)
         
     elif action == "add_batch_req":
         if not message.text.isdigit():
@@ -324,23 +419,10 @@ async def admin_state_machine(client, message: Message):
         admin_states[admin_id]["req_shares"] = int(message.text)
         admin_states[admin_id]["action"] = "add_batch_link"
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
-        await message.reply_text("🔗 **(Step 3/5)**\nअनलॉक होने के बाद यूज़र को कौन सा लिंक मिलना चाहिए? (यहाँ लिंक भेजें)", reply_markup=btn)
+        await message.reply_text("🔗 **(Step 3/3)**\nअनलॉक होने के बाद यूज़र को कौन सा लिंक मिलना चाहिए? (यहाँ लिंक भेजें)", reply_markup=btn)
 
     elif action == "add_batch_link":
         admin_states[admin_id]["unlock_link"] = message.text
-        admin_states[admin_id]["action"] = "add_batch_eng"
-        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
-        await message.reply_text("🇺🇸 **(Step 4/5)**\nइस बैच के लिए English प्रमोशनल मैसेज भेजें:", reply_markup=btn)
-        
-    elif action == "add_batch_eng":
-        admin_states[admin_id]["eng_text"] = message.text
-        admin_states[admin_id]["action"] = "add_batch_hin"
-        btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
-        await message.reply_text("🇮🇳 **(Step 5/5)**\nअब इस बैच के लिए Hindi प्रमोशनल मैसेज भेजें:", reply_markup=btn)
-
-    elif action == "add_batch_hin":
-        # Final Step - Save to Database
-        admin_states[admin_id]["hin_text"] = message.text
         data = admin_states[admin_id]
         batch_id = data["batch_id"]
         
@@ -348,13 +430,11 @@ async def admin_state_machine(client, message: Message):
             {"batch_id": batch_id},
             {"$set": {
                 "req_shares": data["req_shares"],
-                "unlock_link": data["unlock_link"],
-                "eng_text": data["eng_text"],
-                "hin_text": data["hin_text"]
+                "unlock_link": data["unlock_link"]
             }},
             upsert=True
         )
-        del admin_states[admin_id] # Clear state
+        del admin_states[admin_id] 
         bot_username = (await app.get_me()).username
         link = f"https://t.me/{bot_username}?start={batch_id}"
         
