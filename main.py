@@ -29,6 +29,7 @@ admin_states = {}
 
 # --- NEW: In-Memory Cache for Millisecond Response ---
 SETTINGS_CACHE = {}
+PENDING_REQUESTS = set() # To store join requests instantly for fast Try Again access
 
 async def init_settings():
     config = await settings_col.find_one({"_id": "config"})
@@ -173,13 +174,30 @@ async def send_admin_panel(message_or_callback):
     else:
         await safe_edit(message_or_callback, text, reply_markup=btn)
 
-# --- 4. Auto Approve Join Requests ---
+# --- 4. Auto Approve Join Requests (MODIFIED FOR REQUEST MODE) ---
 @app.on_chat_join_request()
 async def auto_approve_requests(client, message: ChatJoinRequest):
     try:
-        await client.approve_chat_join_request(message.chat.id, message.from_user.id)
+        # Client.approve_chat_join_request is removed to keep it in request mode.
+        # We track the request so "Try Again" can give them access seamlessly.
+        user_id = message.from_user.id
+        channel_id = message.chat.id
+        channel_username = message.chat.username
+        
+        channels_to_store = [channel_id]
+        if channel_username:
+            channels_to_store.append(f"@{channel_username.lower()}")
+            
+        for cid in channels_to_store:
+            PENDING_REQUESTS.add((user_id, cid))
+            
+        await users_col.update_one(
+            {"user_id": user_id},
+            {"$addToSet": {"pending_channels": {"$each": channels_to_store}}},
+            upsert=True
+        )
     except Exception as e:
-        print(f"Auto Approve Error: {e}")
+        print(f"Auto Approve Update Error: {e}")
 
 # --- 5. Strict Telegram Force Subscribe Checker (Optimized with Cache) ---
 async def check_fsub(client, user_id):
@@ -191,6 +209,10 @@ async def check_fsub(client, user_id):
     
     if not fsubs:
         return [] 
+        
+    # Fetch user data once for all channels
+    user_data = await users_col.find_one({"user_id": user_id})
+    pending_channels = user_data.get("pending_channels", []) if user_data else []
 
     async def check_single_channel(ch):
         try:
@@ -198,8 +220,15 @@ async def check_fsub(client, user_id):
             if str(raw_id).lstrip('-').isdigit():
                 channel_id = int(raw_id)
             else:
-                channel_id = str(raw_id)
+                channel_id = str(raw_id).lower()
+                if not channel_id.startswith('@'):
+                    channel_id = f"@{channel_id}"
+                    
+            # 1. Check if user sent a join request (instant access granted)
+            if (user_id, channel_id) in PENDING_REQUESTS or channel_id in pending_channels:
+                return None
                 
+            # 2. Check traditional chat member status
             await client.get_chat_member(channel_id, user_id)
             return None
         except UserNotParticipant:
@@ -216,8 +245,8 @@ async def check_fsub(client, user_id):
 async def send_fsub_message(message, start_data, not_joined):
     text = (
         "**Access Restricted! 🚫**\n\n"
-        "**बॉट का उपयोग करने के लिए कृपया हमारे सभी अपडेट चैनल्स को ज्वाइन करें। (अगर चैनल प्राइवेट है, तो रिक्वेस्ट सेंड करें, बोट ऑटो-एक्सेप्ट कर लेगा)**\n\n"
-        "**Please join all our update channels to use this bot.**"
+        "**बॉट का उपयोग करने के लिए कृपया हमारे सभी अपडेट चैनल्स को ज्वाइन करें। (अगर चैनल प्राइवेट है, तो रिक्वेस्ट सेंड करें, बोट ऑटो-एक्सेप्ट नहीं करेगा बल्कि रिक्वेस्ट मोड में ही रखेगा, आप बस Try Again पे क्लिक करें)**\n\n"
+        "**Please join or request all our update channels to use this bot.**"
     )
     
     cb_data = f"checkfsub_{start_data}" if start_data else "checkfsub_none"
@@ -258,7 +287,8 @@ async def start_command(client, message):
             "referred_by": None, 
             "batches": {}, 
             "joined_batches": [],
-            "join_date": datetime.now() 
+            "join_date": datetime.now(),
+            "pending_channels": [] 
         }
         await users_col.insert_one(user_data)
 
