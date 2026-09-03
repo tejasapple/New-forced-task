@@ -1,153 +1,173 @@
+import asyncio
+import aiofiles
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-import sqlite3
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- 1. Bot Configuration ---
-API_ID = "YOUR_API_ID"        # my.telegram.org से लें
-API_HASH = "YOUR_API_HASH"    # my.telegram.org से लें
-BOT_TOKEN = "YOUR_BOT_TOKEN"  # BotFather से लें
-ADMIN_ID = 123456789          # अपना टेलीग्राम User ID डालें
+API_ID = "YOUR_API_ID"
+API_HASH = "YOUR_API_HASH"
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+ADMINS = [123456789] # List of Admin IDs
+MONGO_URI = "mongodb+srv://<user>:<password>@cluster.mongodb.net/?retryWrites=true&w=majority"
+VIP_GROUP_LINK = "https://t.me/+YourVIPGroupLink"
 
-app = Client("my_referral_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("advanced_referral_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- 2. Database Setup ---
-conn = sqlite3.connect("bot_data.db", check_same_thread=False)
-cursor = conn.cursor()
+# --- 2. MongoDB Setup (Motor) ---
+db_client = AsyncIOMotorClient(MONGO_URI)
+db = db_client["ReferralBotDB"]
+users_col = db["users"]
+batches_col = db["batches"]
 
-# Batches Table (एडमिन द्वारा सेट की गई लिंक्स और टेक्स्ट के लिए)
-cursor.execute('''CREATE TABLE IF NOT EXISTS batches 
-                  (batch_id TEXT PRIMARY KEY, eng_text TEXT, hin_text TEXT, unlock_link TEXT, req_shares INTEGER)''')
-
-# Users Table (रेफरल ट्रैक करने के लिए)
-cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                  (user_id INTEGER, batch_id TEXT, referrals INTEGER)''')
-conn.commit()
-
-# --- 3. Start & Referral Logic ---
+# --- 3. Start & Multi-level Referral Logic ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     user_id = message.from_user.id
     args = message.text.split(" ")
+    
+    # Save user globally if new
+    if not await users_col.find_one({"user_id": user_id}):
+        await users_col.insert_one({"user_id": user_id, "is_banned": False, "total_referrals": 0})
 
-    # डिफ़ॉल्ट स्टार्ट मैसेज
+    # Check Ban Status
+    user_data = await users_col.find_one({"user_id": user_id})
+    if user_data.get("is_banned"):
+        return await message.reply_text("🚫 You are banned from using this bot.")
+
     if len(args) == 1:
-        await message.reply_text("Welcome! Please use a valid batch link to start.")
-        return
+        return await message.reply_text("Welcome! Please use a valid batch link to start.")
 
-    # Deep Linking Logic (e.g., /start batch1_9876543)
     start_data = args[1] 
     
     try:
-        # चेक करें कि लिंक में बैच आईडी और रेफर करने वाले का आईडी है या नहीं
         if "_" in start_data:
             batch_id, referrer_id = start_data.split("_")
             referrer_id = int(referrer_id)
             
-            # खुद को रेफर करने से रोकना
             if referrer_id != user_id:
-                # Referrer का काउंट बढ़ाना (यहाँ आप चेक लगा सकते हैं कि नया यूज़र है या पुराना)
-                cursor.execute("SELECT referrals FROM users WHERE user_id=? AND batch_id=?", (referrer_id, batch_id))
-                ref_data = cursor.fetchone()
-                if ref_data:
-                    new_count = ref_data[0] + 1
-                    cursor.execute("UPDATE users SET referrals=? WHERE user_id=? AND batch_id=?", (new_count, referrer_id, batch_id))
-                else:
-                    cursor.execute("INSERT INTO users VALUES (?, ?, ?)", (referrer_id, batch_id, 1))
-                conn.commit()
+                # Anti-fake referral check can be added here
+                referrer_data = await users_col.find_one({"user_id": referrer_id})
+                if referrer_data:
+                    await users_col.update_one({"user_id": referrer_id}, {"$inc": {"total_referrals": 1, f"batches.{batch_id}": 1}})
         else:
             batch_id = start_data
 
-        # बैच की जानकारी डेटाबेस से निकालना
-        cursor.execute("SELECT eng_text, hin_text, unlock_link, req_shares FROM batches WHERE batch_id=?", (batch_id,))
-        batch_info = cursor.fetchone()
-
+        batch_info = await batches_col.find_one({"batch_id": batch_id})
         if not batch_info:
-            await message.reply_text("❌ This batch does not exist.")
-            return
+            return await message.reply_text("❌ This batch does not exist or has expired.")
 
-        eng_text, hin_text, unlock_link, req_shares = batch_info
-        
-        # यूज़र का खुद का डेटा बनाना अगर नहीं है
-        cursor.execute("SELECT referrals FROM users WHERE user_id=? AND batch_id=?", (user_id, batch_id))
-        if not cursor.fetchone():
-            cursor.execute("INSERT INTO users VALUES (?, ?, ?)", (user_id, batch_id, 0))
-            conn.commit()
+        # Update User's Batch Tracking
+        await users_col.update_one({"user_id": user_id}, {"$set": {f"joined_batches.{batch_id}": True}})
 
-        # मैसेज टेक्स्ट तैयार करना
-        full_text = f"{eng_text}\n\n{hin_text}"
+        eng_text = batch_info['eng_text']
+        hin_text = batch_info['hin_text']
         
-        # शेयर लिंक बनाना
         bot_username = (await app.get_me()).username
         share_url = f"https://t.me/share/url?url=https://t.me/{bot_username}?start={batch_id}_{user_id}&text=Join%20this%20awesome%20group!"
 
-        # बटन्स तैयार करना
         buttons = InlineKeyboardMarkup([
             [InlineKeyboardButton("📤 Share (शेयर करें)", url=share_url)],
-            [InlineKeyboardButton("🔓 Unlock Group", callback_data=f"unlock_{batch_id}")]
+            [InlineKeyboardButton("🔓 Free Unlock", callback_data=f"unlock_{batch_id}")],
+            [InlineKeyboardButton("💎 Buy VIP (Direct Access)", callback_data="buy_vip")]
         ])
 
-        await message.reply_text(full_text, reply_markup=buttons)
+        await message.reply_text(f"{eng_text}\n\n{hin_text}", reply_markup=buttons)
 
     except Exception as e:
         await message.reply_text("❌ Invalid Link.")
-        print(e)
+        print(f"Error: {e}")
 
-# --- 4. Unlock Button Logic (Pop-up System) ---
+# --- 4. Callbacks (Unlock & VIP) ---
 @app.on_callback_query(filters.regex(r"^unlock_"))
 async def unlock_button(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     batch_id = callback_query.data.split("_")[1]
 
-    # डेटाबेस से चेक करना कि कितने शेयर (रेफरल) हुए हैं और कितने चाहिए
-    cursor.execute("SELECT referrals FROM users WHERE user_id=? AND batch_id=?", (user_id, batch_id))
-    user_refs = cursor.fetchone()[0]
+    user_data = await users_col.find_one({"user_id": user_id})
+    batch_data = await batches_col.find_one({"batch_id": batch_id})
+    
+    if not batch_data:
+        return await callback_query.answer("Batch Expired!", show_alert=True)
 
-    cursor.execute("SELECT req_shares, unlock_link FROM batches WHERE batch_id=?", (batch_id,))
-    batch_data = cursor.fetchone()
-    req_shares, unlock_link = batch_data[0], batch_data[1]
+    req_shares = batch_data['req_shares']
+    user_refs = user_data.get("batches", {}).get(batch_id, 0)
 
     if user_refs >= req_shares:
-        # अनलॉक सफल! नया बटन दिखाना
-        success_btn = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Access Granted - Click Here", url=unlock_link)]])
-        await callback_query.edit_message_text("🎉 Congratulations! You have successfully unlocked the group.", reply_markup=success_btn)
+        success_btn = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Access Granted", url=batch_data['unlock_link'])]])
+        await callback_query.edit_message_text("🎉 Group Unlocked successfully!", reply_markup=success_btn)
     else:
-        # पॉप-अप अलर्ट (Pop-up Notification)
         remaining = req_shares - user_refs
-        alert_text = f"❌ Access Denied!\n\nYou need {remaining} more shares (referrals) to unlock this."
-        await callback_query.answer(alert_text, show_alert=True) # show_alert=True स्क्रीन पर पॉप-अप लाएगा
+        await callback_query.answer(f"❌ Denied!\nYou need {remaining} more shares.", show_alert=True)
 
-# --- 5. Admin Panel Commands ---
-@app.on_message(filters.command("addbatch") & filters.user(ADMIN_ID))
+@app.on_callback_query(filters.regex(r"^buy_vip$"))
+async def vip_button(client, callback_query: CallbackQuery):
+    vip_btn = InlineKeyboardMarkup([[InlineKeyboardButton("👑 Go to VIP Group", url=VIP_GROUP_LINK)]])
+    await callback_query.edit_message_text("🌟 **VIP Access**\n\nClick below to access the VIP section directly!", reply_markup=vip_btn)
+
+# --- 5. GUI Admin Panel ---
+@app.on_message(filters.command("admin") & filters.user(ADMINS))
+async def admin_panel(client, message):
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"), InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("➕ Add Batch", callback_data="admin_addbatch"), InlineKeyboardButton("⚙️ Manage Users", callback_data="admin_users")]
+    ])
+    await message.reply_text("🛠 **Advanced Admin Control Panel**\nSelect an option below:", reply_markup=buttons)
+
+@app.on_callback_query(filters.regex(r"^admin_"))
+async def admin_callbacks(client, callback_query: CallbackQuery):
+    action = callback_query.data.split("_")[1]
+    
+    if action == "stats":
+        total_users = await users_col.count_documents({})
+        total_batches = await batches_col.count_documents({})
+        await callback_query.edit_message_text(f"📊 **Live Stats**\n\n👥 Total Users: {total_users}\n📦 Active Batches: {total_batches}\n\nUse /admin to go back.")
+    
+    elif action == "addbatch":
+        await callback_query.answer("Use command: /addbatch name|req_shares|link|eng|hin", show_alert=True)
+        
+    elif action == "broadcast":
+        await callback_query.answer("Reply to any message with /broadcast to send it to all users.", show_alert=True)
+
+# --- 6. Broadcast System (Aiofiles Ready) ---
+@app.on_message(filters.command("broadcast") & filters.user(ADMINS) & filters.reply)
+async def broadcast_msg(client, message):
+    msg_to_send = message.reply_to_message
+    users = users_col.find({})
+    success, failed = 0, 0
+    
+    await message.reply_text("📢 Broadcast started...")
+    async for user in users:
+        try:
+            await msg_to_send.copy(user['user_id'])
+            success += 1
+            await asyncio.sleep(0.05) # Prevent FloodWait
+        except:
+            failed += 1
+            
+    await message.reply_text(f"✅ Broadcast Complete!\n\nSuccess: {success}\nFailed: {failed}")
+
+# --- 7. Batch Management Commands ---
+@app.on_message(filters.command("addbatch") & filters.user(ADMINS))
 async def add_batch(client, message):
-    # Syntax: /addbatch batch_name | Req_Shares | Unlock_Link | Eng_Text | Hin_Text
     try:
         data = message.text.split("|")
         batch_id = data[0].split(" ")[1].strip()
         req_shares = int(data[1].strip())
         unlock_link = data[2].strip()
-        eng_text = data[3].strip()
-        hin_text = data[4].strip()
+        eng = data[3].strip()
+        hin = data[4].strip()
 
-        cursor.execute("INSERT OR REPLACE INTO batches VALUES (?, ?, ?, ?, ?)", (batch_id, eng_text, hin_text, unlock_link, req_shares))
-        conn.commit()
-        
+        await batches_col.update_one(
+            {"batch_id": batch_id},
+            {"$set": {"eng_text": eng, "hin_text": hin, "unlock_link": unlock_link, "req_shares": req_shares}},
+            upsert=True
+        )
         bot_username = (await app.get_me()).username
-        await message.reply_text(f"✅ Batch '{batch_id}' added successfully!\n\n🔗 Master Link: `https://t.me/{bot_username}?start={batch_id}`")
+        await message.reply_text(f"✅ Batch '{batch_id}' added!\n🔗 Link: `https://t.me/{bot_username}?start={batch_id}`")
     except Exception as e:
-        await message.reply_text("❌ Syntax Error. Use:\n`/addbatch batch_name | 5 | https://t.me/link | English Text | Hindi Text`")
+        await message.reply_text("❌ Error. Format: `/addbatch name | 5 | link | eng | hin`")
 
-@app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
-async def check_stats(client, message):
-    cursor.execute("SELECT batch_id, COUNT(user_id), SUM(referrals) FROM users GROUP BY batch_id")
-    stats = cursor.fetchall()
-    
-    text = "📊 **Admin Statistics**\n\n"
-    for row in stats:
-        text += f"**Batch:** `{row[0]}`\n👥 Total Users: {row[1]}\n🔗 Total Shares (Referrals): {row[2] or 0}\n\n"
-    
-    await message.reply_text(text)
-
-# Run the bot
 if __name__ == "__main__":
-    print("Bot is running...")
+    print("🚀 Advanced Bot is starting...")
     app.run()
