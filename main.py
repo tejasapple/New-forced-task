@@ -245,7 +245,7 @@ async def check_fsub(client, user_id):
 async def send_fsub_message(message, start_data, not_joined):
     text = (
         "**Access Restricted! 🚫**\n\n"
-        "**बॉट का उपयोग करने के लिए कृपया हमारे सभी अपडेट चैनल्स को ज्वाइन करें। (अगर चैनल प्राइवेट है, तो रिक्वेस्ट सेंड करें, बोट ऑटो-एक्सेप्ट नहीं करेगा बल्कि रिक्वेस्ट मोड में ही रखेगा, आप बस Try Again पे क्लिक करें)**\n\n"
+        "**बॉट का उपयोग करने के लिए कृपया हमारे सभी अपडेट चैनल्स को ज्वाइन करें।  Try Again पे क्लिक करें)**\n\n"
         "**Please join or request all our update channels to use this bot.**"
     )
     
