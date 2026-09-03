@@ -46,15 +46,24 @@ async def update_batch_data(batch_id, update_dict=None):
     return batch_id
 
 # ==========================================
-# --- COLOR BUTTON HTTP BYPASS SYSTEM ---
+# --- COLOR BUTTON HTTP BYPASS SYSTEM (OPTIMIZED) ---
 # ==========================================
 
+http_session = None
+
+async def get_http_session():
+    """Global HTTP Session for faster API calls without lag"""
+    global http_session
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession()
+    return http_session
+
 async def send_via_http(method: str, payload: dict):
-    """Pyrogram के लिमिटेशन को तोड़ने के लिए HTTP रिक्वेस्ट भेजता है"""
+    """Pyrogram के लिमिटेशन को तोड़ने के लिए HTTP रिक्वेस्ट भेजता है (अब फास्ट स्पीड के साथ)"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as resp:
-            return await resp.json()
+    session = await get_http_session()
+    async with session.post(url, json=payload) as resp:
+        return await resp.json()
 
 def convert_md_to_html(text: str) -> str:
     """HTTP API के लिए Pyrogram वाले Markdown को HTML में बदलता है"""
@@ -154,7 +163,7 @@ async def send_admin_panel(message_or_callback):
     else:
         await safe_edit(message_or_callback, text, reply_markup=btn)
 
-# --- 4. Auto Approve Join Requests (अगर कोई रिक्वेस्ट डालता है तो) ---
+# --- 4. Auto Approve Join Requests ---
 @app.on_chat_join_request()
 async def auto_approve_requests(client, message: ChatJoinRequest):
     try:
@@ -162,7 +171,7 @@ async def auto_approve_requests(client, message: ChatJoinRequest):
     except Exception as e:
         print(f"Auto Approve Error: {e}")
 
-# --- 5. Strict Telegram Force Subscribe Checker (Multiple Channels - Optimized) ---
+# --- 5. Strict Telegram Force Subscribe Checker ---
 async def check_fsub(client, user_id):
     if user_id in ADMINS:
         return [] 
@@ -368,7 +377,8 @@ async def unlock_button(client, callback_query: CallbackQuery):
 # --- 8. BUTTON-BASED ADMIN SYSTEM ---
 # ==========================================
 
-@app.on_callback_query(filters.regex(r"^admin_") | filters.regex(r"^add_batch_start$") | filters.regex(r"^edit") | filters.regex(r"^add_fsub") | filters.regex(r"^remove_fsub") | filters.regex(r"^del_fsub_") | filters.regex(r"^btnselect_") | filters.regex(r"^setstyle_") | filters.regex(r"^setfsubstyle_"))
+# Fixed Callback Regex to prevent overlapping and ignoring specific menus
+@app.on_callback_query(filters.regex(r"^admin_") | filters.regex(r"^add_batch_start$") | filters.regex(r"^edit") | filters.regex(r"^add_fsub") | filters.regex(r"^btnselect_") | filters.regex(r"^setstyle_") | filters.regex(r"^setfsubstyle_"))
 async def admin_callbacks(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id not in ADMINS:
@@ -396,14 +406,11 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         batch_stats = ""
         for b in batches:
             b_id = b['batch_id']
-            # Total users joined this batch
             b_count = await users_col.count_documents({"joined_batches": b_id})
-            # Today's new users in this batch
             today_b_count = await users_col.count_documents({
                 "joined_batches": b_id,
                 "join_date": {"$gte": today_start}
             })
-            # Total users who have successfully referred at least 1 person for this batch
             b_shared_count = await users_col.count_documents({f"batches.{b_id}": {"$gt": 0}})
             
             batch_stats += (
@@ -542,14 +549,12 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         btn = InlineKeyboardMarkup([[create_btn("❌ Cancel", callback_data="admin_panel", style="danger")]])
         await safe_edit(callback_query, f"📝 **Broadcast Mode Active**\n\nTarget: **{target}**\n\n👉 Now send the message (Text, Photo, Video) you want to broadcast.", reply_markup=btn)
 
-    # --- Batch Creation (4 Steps with VIP) ---
     elif data == "add_batch_start":
         await callback_query.answer()
         admin_states[user_id] = {"action": "add_batch_name"}
         btn = InlineKeyboardMarkup([[create_btn("❌ Cancel", callback_data="admin_panel", style="danger")]])
         await safe_edit(callback_query, "➕ **Create New Batch (Step 1/4)**\n\n👉 Send the **Name / ID** of the batch (e.g. `Movie1`, `BatchA`):", reply_markup=btn)
 
-    # --- Multiple Settings UI (With FSub Color) ---
     elif data == "admin_settings":
         await callback_query.answer()
         config = await settings_col.find_one({"_id": "config"})
@@ -601,21 +606,8 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         admin_states[user_id] = {"action": "add_fsub_id"}
         btn = InlineKeyboardMarkup([[create_btn("❌ Cancel", callback_data="admin_settings", style="danger")]])
         await safe_edit(callback_query, "👉 Send the new **Telegram FSub Channel ID or Username** (e.g., `-10012345678` or `@mychannel`):\n*(Note: बोट को इस चैनल में एडमिन होना ज़रूरी है)*", reply_markup=btn)
-        
-    elif data == "add_fsub_link":
-        fsub_id = admin_states[admin_id]["fsub_id"]
-        fsub_link = format_telegram_link(message.text)
-        
-        config = await settings_col.find_one({"_id": "config"})
-        fsubs = config.get("fsub", [])
-        fsubs.append({"id": fsub_id, "link": fsub_link})
-        
-        await settings_col.update_one({"_id": "config"}, {"$set": {"fsub": fsubs}})
-        del admin_states[admin_id]
-        
-        btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Settings", callback_data="admin_settings", style="secondary")]])
-        await safe_reply(message, "✅ नया FSub Channel सफलतापूर्वक जोड़ दिया गया है!", reply_markup=btn)
 
+# Separate dedicated callbacks now work flawlessly due to regex fix
 @app.on_callback_query(filters.regex(r"^remove_fsub_menu$"))
 async def remove_fsub_menu_callback(client, callback_query: CallbackQuery):
     await callback_query.answer()
@@ -783,15 +775,32 @@ async def admin_state_machine(client, message: Message):
         btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Settings", callback_data="admin_settings", style="secondary")]])
         await safe_reply(message, "✅ नया FSub Channel सफलतापूर्वक जोड़ दिया गया है!", reply_markup=btn)
 
+# Fixed Crash Issue for VIP Skip Feature
 @app.on_callback_query(filters.regex(r"^skip_vip$"))
 async def skip_vip_callback(client, callback_query: CallbackQuery):
     admin_id = callback_query.from_user.id
     if admin_id in admin_states and admin_states[admin_id].get("action") == "add_batch_vip":
-        message = callback_query.message
-        message.text = "none"
-        message.from_user = callback_query.from_user
-        await callback_query.message.delete()
-        await admin_state_machine(client, message)
+        data = admin_states[admin_id]
+        batch_id = data["batch_id"]
+        
+        await batches_col.update_one(
+            {"batch_id": batch_id},
+            {"$set": {
+                "req_shares": data["req_shares"],
+                "unlock_link": data["unlock_link"],
+                "vip_link": "none",
+                "style_share": "primary", 
+                "style_unlock": "secondary",
+                "style_vip": "success"
+            }},
+            upsert=True
+        )
+        del admin_states[admin_id] 
+        bot_username = (await client.get_me()).username
+        link = f"https://t.me/{bot_username}?start={batch_id}"
+        
+        btn = InlineKeyboardMarkup([[create_btn("🔙 Back to Menu", callback_data="admin_panel", style="secondary")]])
+        await safe_edit(callback_query, f"✅ **Batch '{batch_id}' Successfully Created!**\n\n🎯 Req Shares: {data['req_shares']}\n💎 Buy VIP+: No\n🚀 **Direct Batch Link:**\n`{link}`\n\nइस लिंक को आप सीधे भी शेयर कर सकते हैं।", reply_markup=btn)
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
