@@ -31,6 +31,13 @@ async def init_settings():
             "fsub": [] # मल्टीपल चैनल्स के लिए लिस्ट
         })
 
+# --- Helper Function for Link Parsing (Supports @username) ---
+def format_telegram_link(link: str) -> str:
+    link = link.strip()
+    if link.startswith("@"):
+        return f"https://t.me/{link[1:]}"
+    return link
+
 # --- 3. UI Admin Panel Helper ---
 async def send_admin_panel(message_or_callback):
     btn = InlineKeyboardMarkup([
@@ -55,7 +62,7 @@ async def auto_approve_requests(client, message: ChatJoinRequest):
     except Exception as e:
         print(f"Auto Approve Error: {e}")
 
-# --- 5. Strict Telegram Force Subscribe Checker (Multiple Channels) ---
+# --- 5. Strict Telegram Force Subscribe Checker (Multiple Channels - Optimized) ---
 async def check_fsub(client, user_id):
     if user_id in ADMINS:
         return [] # Admin bypass
@@ -66,16 +73,25 @@ async def check_fsub(client, user_id):
     if not fsubs:
         return [] 
 
-    not_joined = []
-    for ch in fsubs:
+    # Concurrent checking for superfast speed
+    async def check_single_channel(ch):
         try:
-            channel_id = int(ch["id"]) if str(ch["id"]).lstrip('-').isdigit() else ch["id"]
+            raw_id = ch["id"]
+            if str(raw_id).lstrip('-').isdigit():
+                channel_id = int(raw_id)
+            else:
+                channel_id = str(raw_id)
+                
             await client.get_chat_member(channel_id, user_id)
+            return None
         except UserNotParticipant:
-            not_joined.append(ch)
+            return ch
         except Exception as e:
             print(f"FSub Error for {ch['id']}: {e}")
-            pass # अगर बोट एडमिन नहीं है तो इग्नोर करें ताकि यूजर ब्लॉक न हो
+            return None # अगर बोट एडमिन नहीं है तो इग्नोर करें ताकि यूजर ब्लॉक न हो
+
+    results = await asyncio.gather(*(check_single_channel(ch) for ch in fsubs))
+    not_joined = [res for res in results if res is not None]
             
     return not_joined
 
@@ -207,7 +223,8 @@ async def check_fsub_callback(client, callback_query: CallbackQuery):
     not_joined = await check_fsub(client, user_id)
     if not_joined:
         return await callback_query.answer("❌ कृपया पहले सभी चैनल ज्वाइन करें या रिक्वेस्ट सेंड करें!", show_alert=True)
-
+    
+    await callback_query.answer() # Button lag fix
     if start_data and start_data != "none":
         await process_batch_start(client, callback_query, user_id, start_data)
     else:
@@ -231,6 +248,7 @@ async def unlock_button(client, callback_query: CallbackQuery):
     user_refs = user_data.get("batches", {}).get(batch_id, 0)
 
     if user_refs >= req_shares:
+        await callback_query.answer() # Fast Response
         success_btn = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Enter Group / Channel", url=batch_data['unlock_link'])]])
         await callback_query.edit_message_text(f"🎉 **Congratulations!**\nBatch Unlocked successfully. Click below to join:", reply_markup=success_btn)
     else:
@@ -251,11 +269,13 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
     data = callback_query.data
 
     if data == "admin_panel":
+        await callback_query.answer() # Fast Response
         if user_id in admin_states:
             del admin_states[user_id] 
         await send_admin_panel(callback_query)
 
     elif data == "admin_stats":
+        await callback_query.answer() # Fast Response
         total_users = await users_col.count_documents({})
         total_batches = await batches_col.count_documents({})
         
@@ -285,6 +305,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         await callback_query.edit_message_text(text, reply_markup=btn)
 
     elif data == "admin_batches":
+        await callback_query.answer()
         batches = await batches_col.find().to_list(length=100)
         buttons = []
         for b in batches:
@@ -293,6 +314,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         await callback_query.edit_message_text("📦 **Manage Batches**\nSelect a batch to view details:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("admin_viewbatch_"):
+        await callback_query.answer()
         batch_id = data.split("_")[2]
         b = await batches_col.find_one({"batch_id": batch_id})
         if not b:
@@ -319,18 +341,21 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         await callback_query.edit_message_text(text, reply_markup=btn)
         
     elif data.startswith("editlink_"):
+        await callback_query.answer()
         batch_id = data.split("_")[1]
         admin_states[user_id] = {"action": "edit_batch_link", "batch_id": batch_id}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"admin_viewbatch_{batch_id}")]])
-        await callback_query.edit_message_text(f"🔗 **Edit Unlock Link for {batch_id}**\n\n👉 Send the new Unlock Link:", reply_markup=btn)
+        await callback_query.edit_message_text(f"🔗 **Edit Unlock Link for {batch_id}**\n\n👉 Send the new Unlock Link (You can use @username):", reply_markup=btn)
 
     elif data.startswith("editvip_"):
+        await callback_query.answer()
         batch_id = data.split("_")[1]
         admin_states[user_id] = {"action": "edit_batch_vip", "batch_id": batch_id}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"admin_viewbatch_{batch_id}")]])
-        await callback_query.edit_message_text(f"💎 **Edit VIP Link for {batch_id}**\n\n👉 Send the new VIP direct link for this batch:", reply_markup=btn)
+        await callback_query.edit_message_text(f"💎 **Edit VIP Link for {batch_id}**\n\n👉 Send the new VIP direct link or @username:", reply_markup=btn)
 
     elif data.startswith("editreq_"):
+        await callback_query.answer()
         batch_id = data.split("_")[1]
         admin_states[user_id] = {"action": "edit_batch_req", "batch_id": batch_id}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"admin_viewbatch_{batch_id}")]])
@@ -343,6 +368,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         await send_admin_panel(callback_query)
 
     elif data == "admin_bcast_menu":
+        await callback_query.answer()
         btn = InlineKeyboardMarkup([
             [InlineKeyboardButton("📢 Broadcast to ALL Users", callback_data="admin_bcast_all")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="admin_panel")]
@@ -350,6 +376,7 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         await callback_query.edit_message_text("📢 **Broadcast Menu**\n\nChoose target audience. For specific batch, go to 'Manage Batches'.", reply_markup=btn)
 
     elif data.startswith("admin_bcast_"):
+        await callback_query.answer()
         target = data.replace("admin_bcast_", "")
         admin_states[user_id] = {"action": "broadcast", "target": target}
         
@@ -358,12 +385,14 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
 
     # --- Batch Creation (4 Steps with VIP) ---
     elif data == "add_batch_start":
+        await callback_query.answer()
         admin_states[user_id] = {"action": "add_batch_name"}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
         await callback_query.edit_message_text("➕ **Create New Batch (Step 1/4)**\n\n👉 Send the **Name / ID** of the batch (e.g. `Movie1`, `BatchA`):", reply_markup=btn)
 
     # --- Multiple Settings UI ---
     elif data == "admin_settings":
+        await callback_query.answer()
         config = await settings_col.find_one({"_id": "config"})
         fsubs = config.get("fsub", [])
         
@@ -379,11 +408,13 @@ async def admin_callbacks(client, callback_query: CallbackQuery):
         await callback_query.edit_message_text(text, reply_markup=btn)
         
     elif data == "add_fsub_start":
+        await callback_query.answer()
         admin_states[user_id] = {"action": "add_fsub_id"}
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_settings")]])
-        await callback_query.edit_message_text("👉 Send the new **Telegram FSub Channel ID** (e.g., `-10012345678`):\n*(Note: बोट को इस चैनल में एडमिन होना ज़रूरी है)*", reply_markup=btn)
+        await callback_query.edit_message_text("👉 Send the new **Telegram FSub Channel ID or Username** (e.g., `-10012345678` or `@mychannel`):\n*(Note: बोट को इस चैनल में एडमिन होना ज़रूरी है)*", reply_markup=btn)
         
     elif data == "remove_fsub_menu":
+        await callback_query.answer()
         config = await settings_col.find_one({"_id": "config"})
         fsubs = config.get("fsub", [])
         if not fsubs:
@@ -451,14 +482,16 @@ async def admin_state_machine(client, message: Message):
     # --- Edit Specific Batch Info ---
     elif action == "edit_batch_link":
         batch_id = state_info["batch_id"]
-        await batches_col.update_one({"batch_id": batch_id}, {"$set": {"unlock_link": message.text}})
+        new_link = format_telegram_link(message.text)
+        await batches_col.update_one({"batch_id": batch_id}, {"$set": {"unlock_link": new_link}})
         del admin_states[admin_id]
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}")]])
         await message.reply_text(f"✅ Unlock Link for '{batch_id}' updated!", reply_markup=btn)
 
     elif action == "edit_batch_vip":
         batch_id = state_info["batch_id"]
-        await batches_col.update_one({"batch_id": batch_id}, {"$set": {"vip_link": message.text}})
+        new_link = format_telegram_link(message.text)
+        await batches_col.update_one({"batch_id": batch_id}, {"$set": {"vip_link": new_link}})
         del admin_states[admin_id]
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Batch", callback_data=f"admin_viewbatch_{batch_id}")]])
         await message.reply_text(f"✅ VIP Link for '{batch_id}' updated!", reply_markup=btn)
@@ -485,10 +518,10 @@ async def admin_state_machine(client, message: Message):
         admin_states[admin_id]["req_shares"] = int(message.text)
         admin_states[admin_id]["action"] = "add_batch_link"
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
-        await message.reply_text("🔗 **(Step 3/4)**\nअनलॉक होने के बाद यूज़र को कौन सा लिंक मिलना चाहिए? (यहाँ लिंक भेजें)", reply_markup=btn)
+        await message.reply_text("🔗 **(Step 3/4)**\nअनलॉक होने के बाद यूज़र को कौन सा लिंक मिलना चाहिए? (यहाँ लिंक या @username भेजें)", reply_markup=btn)
 
     elif action == "add_batch_link":
-        admin_states[admin_id]["unlock_link"] = message.text
+        admin_states[admin_id]["unlock_link"] = format_telegram_link(message.text)
         admin_states[admin_id]["action"] = "add_batch_vip"
         btn = InlineKeyboardMarkup([
             [InlineKeyboardButton("⏭ Skip VIP", callback_data="skip_vip")],
@@ -496,8 +529,8 @@ async def admin_state_machine(client, message: Message):
         ])
         await message.reply_text("💎 **(Step 4/4)**\nइस बैच के लिए VIP डायरेक्ट लिंक भेजें। (अगर नहीं लगाना तो Skip पर क्लिक करें)", reply_markup=btn)
 
-    elif action == "add_batch_vip" or (message.text == "skip" if message.text else False):
-        vip_link = message.text if message.text else "none"
+    elif action == "add_batch_vip" or (message.text.lower() == "skip" if message.text else False):
+        vip_link = format_telegram_link(message.text) if message.text and message.text.lower() != "skip" else "none"
         data = admin_states[admin_id]
         batch_id = data["batch_id"]
         
@@ -522,11 +555,11 @@ async def admin_state_machine(client, message: Message):
         admin_states[admin_id]["fsub_id"] = message.text
         admin_states[admin_id]["action"] = "add_fsub_link"
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_settings")]])
-        await message.reply_text("🔗 अब इस चैनल का **Invite Link** भेजें:", reply_markup=btn)
+        await message.reply_text("🔗 अब इस चैनल का **Invite Link** या **Username** भेजें:", reply_markup=btn)
         
     elif action == "add_fsub_link":
         fsub_id = admin_states[admin_id]["fsub_id"]
-        fsub_link = message.text
+        fsub_link = format_telegram_link(message.text)
         
         config = await settings_col.find_one({"_id": "config"})
         fsubs = config.get("fsub", [])
