@@ -5,8 +5,8 @@ from pyrogram.errors import UserNotParticipant
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- 1. Bot Configuration ---
-API_ID = "YOUR_API_ID"
-API_HASH = "YOUR_API_HASH"
+API_ID = "31660355"
+API_HASH = "78292fcf0b3c508b3257e9dda9728df4"
 BOT_TOKEN = "8686602550:AAEFJlK2QIkE5Dfi52QADj_j0EXtrU57QoI"
 ADMINS = [7121137252] # अपना Admin ID डालें
 MONGO_URI = "mongodb+srv://Mrxtejas7:Mrxtejas@cluster0.11rnf4k.mongodb.net/?appName=Cluster0"
